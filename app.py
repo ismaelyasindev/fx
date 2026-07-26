@@ -1191,11 +1191,23 @@ async def trigger_backfill():
 
 @app.get("/", response_class=HTMLResponse)
 async def serve_frontend():
-    for path in (Path(__file__).parent / "public" / "index.html",
-                 Path(__file__).parent / "index.html"):
-        if path.exists():
-            return HTMLResponse(content=path.read_text())
-    raise HTTPException(status_code=404, detail="index.html not found")
+    # On Vercel, `public/` is often CDN-only and missing from the function
+    # bundle unless includeFiles pulls it in — search several locations.
+    bases = [Path(__file__).resolve().parent, Path.cwd()]
+    candidates = []
+    for base in bases:
+        candidates.append(base / "public" / "index.html")
+        candidates.append(base / "index.html")
+    for path in candidates:
+        try:
+            if path.is_file():
+                return HTMLResponse(content=path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+    raise HTTPException(
+        status_code=404,
+        detail="index.html not found",
+    )
 
 @app.on_event("startup")
 async def on_startup():
