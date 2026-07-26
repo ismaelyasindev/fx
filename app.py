@@ -22,6 +22,9 @@ from scraper import (
     run_sync, get_analysis_summary, get_event_history,
     get_last_sync, get_journal_rows, save_journal_note,
     get_news_event, scrape_upcoming, get_upcoming_from_db, get_brief, NEWS_MAP,
+    build_event_groups, get_group_analysis,
+    audit_matches, audit_reclassify, backfill_missing_reactions,
+    count_events_without_reactions, ensure_tables, reclassify_existing_rows,
 )
 
 # ── APP SETUP ─────────────────────────────────────────────
@@ -98,6 +101,26 @@ def init_db():
             seed_ratings,
         )
 
+    # Ensure new watchlist entries always have ratings (ON CONFLICT DO NOTHING is safe)
+    c.execute(
+        "INSERT INTO news_ratings (name, type, comment) VALUES (%s, %s, %s) ON CONFLICT (name) DO NOTHING",
+        ("Average Earnings UK", "Caution", "New to watchlist July 2026 - no personal history yet"),
+    )
+
+    # Section 1: risk management settings defaults
+    risk_defaults = [
+        ("starting_balance", "5000"),
+        ("account_currency", "GBP"),
+        ("default_risk_pct", "2"),
+        ("daily_loss_limit_pct", "6"),
+        ("max_trades_per_day", "3"),
+    ]
+    for key, val in risk_defaults:
+        c.execute(
+            "INSERT INTO settings (key,value) VALUES (%s,%s) ON CONFLICT (key) DO NOTHING",
+            (key, val)
+        )
+
     c.execute("SELECT COUNT(*) AS count FROM trades")
     if c.fetchone()["count"] == 0:
         seed_trades = [
@@ -140,6 +163,16 @@ class Trade(BaseModel):
     improvement: Optional[str] = ""
     news_event_id: Optional[int] = None
     trade_type: Optional[str] = "live"
+    # Section 1: money capture
+    account_balance: Optional[float] = None
+    risk_percent: Optional[float] = None
+    risk_amount: Optional[float] = None
+    lot_size: Optional[float] = None
+    entry_price: Optional[float] = None
+    exit_price: Optional[float] = None
+    pnl: Optional[float] = None
+    spread_at_entry: Optional[float] = None
+    direction: Optional[str] = None
 
 class JournalNote(BaseModel):
     note: str
@@ -165,13 +198,25 @@ def normalize_trade_type(value: str | None, default: str = "backtesting") -> str
 
 def ensure_trade_schema(conn) -> None:
     c = conn.cursor()
-    c.execute("""
-        ALTER TABLE trades ADD COLUMN IF NOT EXISTS trade_type TEXT NOT NULL DEFAULT 'backtesting'
-    """)
-    c.execute("""
-        UPDATE trades SET trade_type = 'backtesting'
-        WHERE trade_type IS NULL OR trade_type = ''
-    """)
+    c.execute("ALTER TABLE trades ADD COLUMN IF NOT EXISTS trade_type TEXT NOT NULL DEFAULT 'backtesting'")
+    c.execute("UPDATE trades SET trade_type = 'backtesting' WHERE trade_type IS NULL OR trade_type = ''")
+    # Section 1: money capture columns
+    money_cols = [
+        "ALTER TABLE trades ADD COLUMN IF NOT EXISTS account_balance REAL",
+        "ALTER TABLE trades ADD COLUMN IF NOT EXISTS risk_percent REAL",
+        "ALTER TABLE trades ADD COLUMN IF NOT EXISTS risk_amount REAL",
+        "ALTER TABLE trades ADD COLUMN IF NOT EXISTS lot_size REAL",
+        "ALTER TABLE trades ADD COLUMN IF NOT EXISTS entry_price REAL",
+        "ALTER TABLE trades ADD COLUMN IF NOT EXISTS exit_price REAL",
+        "ALTER TABLE trades ADD COLUMN IF NOT EXISTS pnl REAL",
+        "ALTER TABLE trades ADD COLUMN IF NOT EXISTS spread_at_entry REAL",
+        "ALTER TABLE trades ADD COLUMN IF NOT EXISTS direction TEXT",
+    ]
+    for sql in money_cols:
+        try:
+            c.execute(sql)
+        except Exception as e:
+            print(f"  trade schema: {e}")
     conn.commit()
 
 
@@ -191,6 +236,13 @@ class SettingsUpdate(BaseModel):
     token: str
     account_id: str
     env: str
+
+class RiskSettings(BaseModel):
+    starting_balance: Optional[str] = "5000"
+    account_currency: Optional[str] = "GBP"
+    default_risk_pct: Optional[str] = "2"
+    daily_loss_limit_pct: Optional[str] = "6"
+    max_trades_per_day: Optional[str] = "3"
 
 class ScoreRequest(BaseModel):
     events: list
@@ -215,13 +267,19 @@ def create_trade(trade: Trade):
     c = conn.cursor()
     trade_type = normalize_trade_type(trade.trade_type, default="live")
     c.execute("""
-        INSERT INTO trades (date,news1,news2,news3,entry,ratio,sl,previous,forecast,actual,outcome,improvement,news_event_id,trade_type)
-        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        INSERT INTO trades
+            (date,news1,news2,news3,entry,ratio,sl,previous,forecast,actual,outcome,improvement,
+             news_event_id,trade_type,
+             account_balance,risk_percent,risk_amount,lot_size,
+             entry_price,exit_price,pnl,spread_at_entry,direction)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
         RETURNING id
     """, (trade.date, trade.news1, trade.news2 or "", trade.news3 or "",
           trade.entry or "", trade.ratio, trade.sl,
           trade.previous or "", trade.forecast or "", trade.actual or "",
-          trade.outcome, trade.improvement or "", trade.news_event_id, trade_type))
+          trade.outcome, trade.improvement or "", trade.news_event_id, trade_type,
+          trade.account_balance, trade.risk_percent, trade.risk_amount, trade.lot_size,
+          trade.entry_price, trade.exit_price, trade.pnl, trade.spread_at_entry, trade.direction))
     trade_id = c.fetchone()["id"]
     conn.commit()
     conn.close()
@@ -253,12 +311,12 @@ def _no_reaction_response() -> dict:
 def get_related_event_names(your_name: str) -> list[str]:
     """Watchlist aliases that may share the same FF release (e.g. PPI MoM US ↔ PPI US)."""
     names = [your_name]
-    match = next(((n, kw, country) for n, kw, country, _ in NEWS_MAP if n == your_name), None)
+    match = next(((n, kw, country) for n, kw, country, _mi, _ex in NEWS_MAP if n == your_name), None)
     if not match:
         return names
     _, keyword, country = match
     kw_root = keyword.lower().split()[0]
-    for n, kw, c, _ in NEWS_MAP:
+    for n, kw, c, _mi, _ex in NEWS_MAP:
         if c != country or n == your_name or n in names:
             continue
         other_root = kw.lower().split()[0]
@@ -449,8 +507,17 @@ def get_settings():
     conn = get_db()
     rows = conn.execute("SELECT key, value FROM settings").fetchall()
     conn.close()
-    result = {r["key"]: r["value"] for r in rows}
-    return {"token": result.get("token",""), "account_id": result.get("account_id",""), "env": result.get("env","practice")}
+    r = {row["key"]: row["value"] for row in rows}
+    return {
+        "token": r.get("token", ""),
+        "account_id": r.get("account_id", ""),
+        "env": r.get("env", "practice"),
+        "starting_balance": r.get("starting_balance", "5000"),
+        "account_currency": r.get("account_currency", "GBP"),
+        "default_risk_pct": r.get("default_risk_pct", "2"),
+        "daily_loss_limit_pct": r.get("daily_loss_limit_pct", "6"),
+        "max_trades_per_day": r.get("max_trades_per_day", "3"),
+    }
 
 @app.post("/api/settings")
 def save_settings(s: SettingsUpdate):
@@ -460,6 +527,66 @@ def save_settings(s: SettingsUpdate):
     conn.commit()
     conn.close()
     return {"message": "Saved"}
+
+@app.post("/api/settings/risk")
+def save_risk_settings(s: RiskSettings):
+    conn = get_db()
+    for key, val in [
+        ("starting_balance", s.starting_balance),
+        ("account_currency", s.account_currency),
+        ("default_risk_pct", s.default_risk_pct),
+        ("daily_loss_limit_pct", s.daily_loss_limit_pct),
+        ("max_trades_per_day", s.max_trades_per_day),
+    ]:
+        conn.execute(
+            "INSERT INTO settings (key,value) VALUES (%s,%s) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (key, val or "")
+        )
+    conn.commit()
+    conn.close()
+    return {"message": "Saved"}
+
+@app.get("/api/daily-status")
+def get_daily_status():
+    from datetime import date
+    today = date.today().isoformat()
+    conn = get_db()
+    rows = conn.execute("SELECT key, value FROM settings").fetchall()
+    cfg = {r["key"]: r["value"] for r in rows}
+    starting_balance = float(cfg.get("starting_balance", "5000") or "5000")
+    daily_limit_pct = float(cfg.get("daily_loss_limit_pct", "6") or "6")
+    max_trades = int(cfg.get("max_trades_per_day", "3") or "3")
+    account_currency = cfg.get("account_currency", "GBP")
+
+    live_trades = [dict(r) for r in conn.execute(
+        "SELECT pnl, date FROM trades WHERE trade_type = 'live'"
+    ).fetchall()]
+    conn.close()
+
+    total_pnl = sum((t["pnl"] or 0) for t in live_trades)
+    current_balance = starting_balance + total_pnl
+
+    today_trades = [t for t in live_trades if t["date"] == today]
+    today_pnl = sum((t["pnl"] or 0) for t in today_trades)
+    today_count = len(today_trades)
+
+    daily_limit_amount = current_balance * daily_limit_pct / 100
+    daily_loss = max(0.0, -today_pnl)
+
+    return {
+        "today_pnl": round(today_pnl, 2),
+        "today_count": today_count,
+        "daily_limit_amount": round(daily_limit_amount, 2),
+        "daily_loss": round(daily_loss, 2),
+        "daily_limit_hit": daily_loss >= daily_limit_amount,
+        "trade_limit_hit": today_count >= max_trades,
+        "remaining_before_limit": round(max(0.0, daily_limit_amount - daily_loss), 2),
+        "current_balance": round(current_balance, 2),
+        "starting_balance": starting_balance,
+        "max_trades": max_trades,
+        "daily_limit_pct": daily_limit_pct,
+        "account_currency": account_currency,
+    }
 
 # ── ROUTES: OANDA PROXY ───────────────────────────────────
 @app.get("/api/oanda/price")
@@ -813,7 +940,7 @@ async def trigger_full_sync():
     global sync_status
     if sync_status["running"]:
         return {"message": "Sync already running"}
-    sync_status = {"running": True, "progress": 0, "message": "Starting full resync from Jan 2020...", "stage": "starting"}
+    sync_status = {"running": True, "progress": 0, "message": "Starting full resync from Jan 2015...", "stage": "starting"}
 
     async def progress_callback(update: dict):
         global sync_status
@@ -825,7 +952,7 @@ async def trigger_full_sync():
         try:
             result = await run_sync(
                 progress_callback=progress_callback,
-                start_date=datetime(2020, 1, 1),
+                start_date=datetime(2015, 1, 1),
             )
             sync_status = {"running": False, "progress": 100, "stage": "done",
                           "message": f"Full resync complete — {result['new_events']} new events, {result['reactions_fetched']} reactions fetched",
@@ -834,7 +961,7 @@ async def trigger_full_sync():
             sync_status = {"running": False, "progress": 0, "stage": "error", "message": str(e)}
 
     asyncio.create_task(do_sync())
-    return {"message": "Full resync started — this will take 20-30 minutes"}
+    return {"message": "Full resync started — this will take 2-3 hours"}
 
 @app.get("/api/sync/status")
 def get_sync_status():
@@ -849,15 +976,54 @@ def get_analysis():
         conn = get_db()
         total_events = conn.execute("SELECT COUNT(*) AS count FROM news_events").fetchone()["count"]
         total_reactions = conn.execute("SELECT COUNT(*) AS count FROM price_reactions").fetchone()["count"]
+        # Co-occurrence group count and shared-reading membership
+        group_count = 0
+        shared_reading: dict = {}
+        try:
+            group_count = conn.execute(
+                "SELECT COUNT(DISTINCT group_key) AS cnt FROM event_groups"
+            ).fetchone()["cnt"] or 0
+            # Events in groups with 8+ occurrences get a SHARED READING flag
+            grp_rows = conn.execute("""
+                SELECT group_key, COUNT(*) AS occ
+                FROM event_groups
+                GROUP BY group_key
+                HAVING COUNT(*) >= 8
+            """).fetchall()
+            for r in grp_rows:
+                gk = dict(r)["group_key"]
+                occ = dict(r)["occ"]
+                members = gk.split("|")
+                shared_reading[gk] = {"members": members, "occurrences": occ}
+        except Exception:
+            pass
         conn.close()
         return {
             "summary": summary,
             "last_sync": last,
             "total_events": total_events,
-            "total_reactions": total_reactions
+            "total_reactions": total_reactions,
+            "group_count": group_count,
+            "shared_reading": shared_reading,
         }
     except Exception as e:
-        return {"summary": [], "last_sync": None, "total_events": 0, "total_reactions": 0, "error": str(e)}
+        return {"summary": [], "last_sync": None, "total_events": 0, "total_reactions": 0,
+                "group_count": 0, "shared_reading": {}, "error": str(e)}
+
+
+@app.get("/api/group-brief")
+def get_group_brief(events: list[str] = Query([])):
+    """Return co-occurrence statistics for a set of same-time event names."""
+    try:
+        if len(events) < 2:
+            return {"error": "At least 2 events required", "total_occurrences": 0, "has_sufficient_data": False}
+        group_key = "|".join(sorted(events))
+        data = get_group_analysis(group_key)
+        data["has_sufficient_data"] = data.get("total_occurrences", 0) >= 8
+        data["individual_briefs"] = None
+        return data
+    except Exception as e:
+        return {"error": str(e), "total_occurrences": 0, "has_sufficient_data": False, "scenarios": []}
 
 @app.get("/api/analysis/{event_name}")
 def get_event_detail(event_name: str):
@@ -911,10 +1077,15 @@ def create_journal_trade(event_id: int, body: JournalTrade):
 _upcoming_cache = {"data": None, "expires": None, "source": None}
 
 @app.get("/api/upcoming")
-async def get_upcoming():
+async def get_upcoming(refresh: bool = Query(False)):
     global _upcoming_cache
     now = datetime.now()
-    if _upcoming_cache["data"] is not None and _upcoming_cache["expires"] and now < _upcoming_cache["expires"]:
+    if (
+        not refresh
+        and _upcoming_cache["data"]
+        and _upcoming_cache["expires"]
+        and now < _upcoming_cache["expires"]
+    ):
         return {
             "events": _upcoming_cache["data"],
             "cached": True,
@@ -923,13 +1094,25 @@ async def get_upcoming():
     try:
         events = await scrape_upcoming(7)
         source = "live"
+        warning = None
         if not events:
             events = get_upcoming_from_db(7)
             source = "database"
-        _upcoming_cache["data"] = events
-        _upcoming_cache["expires"] = now + timedelta(hours=1)
-        _upcoming_cache["source"] = source
-        return {"events": events, "cached": False, "source": source}
+            if not events:
+                warning = (
+                    "No upcoming events found. Forex Factory may be blocked, or no watchlist "
+                    "events in the next 7 days. Try Sync on Analysis to refresh calendar data."
+                )
+        if events:
+            _upcoming_cache["data"] = events
+            _upcoming_cache["expires"] = now + timedelta(hours=1)
+            _upcoming_cache["source"] = source
+        else:
+            _upcoming_cache = {"data": None, "expires": None, "source": None}
+        out = {"events": events, "cached": False, "source": source}
+        if warning:
+            out["warning"] = warning
+        return out
     except Exception as e:
         events = get_upcoming_from_db(7)
         if events:
@@ -947,6 +1130,65 @@ def get_trade_brief(event_name: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 # ── SERVE FRONTEND (local dev; on Vercel use public/index.html) ──
+@app.get("/api/audit/matches")
+def get_audit_matches():
+    return {"events": audit_matches()}
+
+@app.post("/api/admin/reclassify")
+def reclassify_events(confirm: bool = Query(False)):
+    to_delete = audit_reclassify()
+    if not confirm:
+        return {"to_delete": len(to_delete), "preview": to_delete[:30], "confirmed": False}
+    if not to_delete:
+        return {"deleted": 0, "message": "Nothing to reclassify"}
+    ids = [r["id"] for r in to_delete]
+    conn = get_db()
+    try:
+        placeholders = ",".join(["%s"] * len(ids))
+        conn.execute(f"DELETE FROM price_reactions WHERE news_event_id IN ({placeholders})", tuple(ids))
+        conn.execute(f"DELETE FROM news_events WHERE id IN ({placeholders})", tuple(ids))
+        conn.commit()
+    finally:
+        conn.close()
+    return {"deleted": len(ids), "message": f"Removed {len(ids)} mismatched rows"}
+
+@app.post("/api/reclassify-beatmiss")
+def reclassify_beatmiss():
+    """Re-run the hybrid beat/miss classifier on all existing news_events rows.
+
+    Returns the number of rows whose beat_miss value changed. Safe to call
+    multiple times; idempotent after the first run.
+    """
+    try:
+        result = reclassify_existing_rows()
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/backfill/status")
+def backfill_status():
+    return {"missing_reactions": count_events_without_reactions()}
+
+@app.post("/api/backfill")
+async def trigger_backfill():
+    global sync_status
+    if sync_status.get("running"):
+        return {"message": "Sync already running — backfill will run at end of sync"}
+    sync_status = {"running": True, "progress": 0, "message": "Backfilling missing reactions...", "stage": "backfill"}
+
+    async def do_backfill():
+        global sync_status
+        try:
+            filled = await backfill_missing_reactions()
+            build_event_groups()
+            sync_status = {"running": False, "progress": 100, "stage": "done",
+                           "message": f"Backfill complete — {filled} reactions filled"}
+        except Exception as e:
+            sync_status = {"running": False, "progress": 0, "stage": "error", "message": str(e)}
+
+    asyncio.create_task(do_backfill())
+    return {"message": "Backfill started"}
+
 @app.get("/", response_class=HTMLResponse)
 async def serve_frontend():
     for path in (Path(__file__).parent / "public" / "index.html",
@@ -956,27 +1198,41 @@ async def serve_frontend():
     raise HTTPException(status_code=404, detail="index.html not found")
 
 @app.on_event("startup")
-def on_startup():
+async def on_startup():
     if os.getenv("VERCEL"):
         try:
             conn = get_db()
             ensure_trade_schema(conn)
             conn.close()
+            ensure_tables()
         except Exception as e:
             print(f"Schema check failed: {e}")
         return
     try:
         init_db()
+        ensure_tables()
     except Exception as e:
         print(f"Database startup check failed: {e}")
+    # Auto-backfill missing reactions in background on every startup
+    async def _startup_backfill():
+        try:
+            filled = await backfill_missing_reactions()
+            if filled > 0:
+                build_event_groups()
+                print(f"Startup backfill: {filled} reactions filled")
+        except Exception as e:
+            print(f"Startup backfill error: {e}")
+    asyncio.create_task(_startup_backfill())
 
 # ── RUN ───────────────────────────────────────────────────
 if __name__ == "__main__":
     import uvicorn
     init_db()
+    host = os.environ.get("HOST", "0.0.0.0")
+    port = int(os.environ.get("PORT", "8000"))
     print("\n" + "="*50)
     print("  GBP/USD Trading Intelligence")
-    print("  Running at: http://localhost:8000")
+    print(f"  Running at: http://localhost:{port}")
     print("  Press Ctrl+C to stop")
     print("="*50 + "\n")
-    uvicorn.run(app, host="127.0.0.1", port=8000, log_level="warning")
+    uvicorn.run(app, host=host, port=port, log_level="warning")

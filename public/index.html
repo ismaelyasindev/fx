@@ -159,6 +159,11 @@
   .live-stage-go{background:var(--green-dim);border:1px solid var(--green)}
   .live-stage-no{background:var(--red-dim);border:1px solid var(--red)}
   .live-stage-warn{background:var(--amber-dim);border:1px solid var(--amber)}
+  .multi-event-tag{background:var(--amber-dim);color:var(--amber);font-size:10px;border-radius:4px;padding:2px 6px;font-weight:600;vertical-align:middle;margin-left:4px}
+  .shared-reading-tag{background:var(--amber-dim);color:var(--amber);font-size:10px;border-radius:4px;padding:2px 5px;font-weight:600;vertical-align:middle;margin-left:6px;cursor:help}
+  .live-combined-verdict{min-height:120px;padding:24px;border-radius:10px;margin-top:10px;line-height:1.7}
+  .live-combined-tags{font-size:11px;color:var(--text2);margin-top:10px;line-height:1.8}
+  .live-combined-reasoning{font-size:13px;color:var(--text2);font-style:italic;margin-top:12px;line-height:1.6}
   .perf-insight{font-size:12px;color:var(--text2);font-style:italic;margin-top:10px;line-height:1.6}
   .perf-dots{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:12px 0}
   .perf-dot{width:14px;height:14px;border-radius:50%;flex-shrink:0}
@@ -174,6 +179,23 @@
   .note-cell:focus{border-color:var(--accent);outline:none;background:var(--surface2)}
   .inline-trade-form{background:var(--surface2);border:1px solid var(--border);border-radius:8px;padding:14px;margin:8px 0}
   @media(max-width:900px){.stats-grid{grid-template-columns:repeat(2,1fr)}.two-col{grid-template-columns:1fr}.form-grid{grid-template-columns:1fr}.form-grid-3{grid-template-columns:1fr 1fr}.three-col{grid-template-columns:1fr 1fr}.upcoming-row{grid-template-columns:1fr;gap:6px}}
+  /* Section 2: Daily limit banner */
+  .limit-banner{border-radius:8px;padding:14px 18px;margin-bottom:20px;font-size:13px;font-weight:600;line-height:1.6;border:1px solid}
+  .limit-banner.red{background:var(--red-dim);border-color:var(--red);color:var(--red)}
+  .limit-banner.amber{background:var(--amber-dim);border-color:var(--amber);color:var(--amber)}
+  .limit-banner.green{background:var(--green-dim);border-color:var(--green);color:var(--green)}
+  /* Position size calculator */
+  .calc-result{font-family:var(--mono);font-size:22px;font-weight:700;margin:12px 0}
+  .drawdown-table{width:100%;border-collapse:collapse;font-size:12px;margin-top:12px}
+  .drawdown-table th{padding:7px 10px;color:var(--text2);font-size:10px;text-transform:uppercase;letter-spacing:1px;border-bottom:1px solid var(--border);text-align:left}
+  .drawdown-table td{padding:7px 10px;font-family:var(--mono);border-bottom:1px solid var(--border)}
+  .drawdown-table .danger-balance{color:var(--red)}
+  .risk-warn{font-size:12px;margin-top:10px;line-height:1.6;padding:10px;border-radius:6px}
+  .risk-warn.red{background:var(--red-dim);color:var(--red)}
+  .risk-warn.amber{background:var(--amber-dim);color:var(--amber)}
+  .consistency-warn{background:var(--red-dim);color:var(--red);font-size:12px;padding:8px 12px;border-radius:6px;margin-top:8px;border:1px solid var(--red)}
+  /* Shared reading for <5 solo */
+  .direction-na{color:var(--text3);font-size:11px;font-style:italic}
 </style>
 </head>
 <body>
@@ -184,6 +206,7 @@
       <div class="logo-sub">Trading Intelligence</div>
     </div>
     <div class="nav-item" onclick="nav('thisweek')"><span>📅</span> This Week</div>
+    <div class="nav-item" onclick="nav('livetrades')"><span>💷</span> Live Trades</div>
     <div class="nav-item active" onclick="nav('dashboard')"><span>📊</span> Dashboard</div>
     <div class="nav-item" onclick="nav('performance')"><span>📈</span> Performance</div>
     <div class="nav-item" onclick="nav('analysis')"><span>🔬</span> Analysis</div>
@@ -192,6 +215,7 @@
     <div class="nav-item" onclick="nav('log')"><span>➕</span> Log Trade</div>
     <div class="nav-item" onclick="nav('newscheck')"><span>📰</span> News Ratings</div>
     <div class="nav-item" onclick="nav('settings')"><span>⚙️</span> Settings</div>
+    <div class="nav-item" onclick="nav('blueprint')"><span>📋</span> Blueprint</div>
     <div class="sidebar-footer">
       <div class="conn-status">
         <span class="conn-dot" id="conn-dot"></span>
@@ -207,7 +231,7 @@
 const API = (location.hostname === 'localhost' || location.hostname === '127.0.0.1')
   ? 'http://localhost:8000/api'
   : `${location.origin}/api`;
-const NAV_PAGES = ['thisweek','dashboard','performance','analysis','journal','scorer','log','newscheck','settings'];
+const NAV_PAGES = ['thisweek','livetrades','dashboard','performance','analysis','journal','scorer','log','newscheck','settings','blueprint'];
 let page = 'dashboard';
 let ratings = [];
 let syncPollTimer = null;
@@ -216,6 +240,7 @@ let journalDataCache = null;
 let pendingLogNews = '';
 let pendingLogPrefill = null;
 let liveAssistantState = null;
+let thisWeekEventsCache = [];
 let dashTradeType = 'all';
 let perfTradeType = 'all';
 let filterState = { range: 'all', dateFrom: '', dateTo: '', country: 'all', impact: 'all', tradeableOnly: false };
@@ -284,9 +309,9 @@ const DEL  = path       => api('DELETE', path);
 function getDateBounds() {
   const today = new Date().toISOString().split('T')[0];
   if (filterState.range === 'after_trump') return { from: '2025-01-20', to: today };
-  if (filterState.range === 'before_trump') return { from: '2020-01-01', to: '2025-01-19' };
-  if (filterState.range === 'custom') return { from: filterState.dateFrom || '2020-01-01', to: filterState.dateTo || today };
-  return { from: '2020-01-01', to: today };
+  if (filterState.range === 'post_covid')  return { from: '2020-03-01', to: today };
+  if (filterState.range === 'custom') return { from: filterState.dateFrom || '2015-01-01', to: filterState.dateTo || today };
+  return { from: '2015-01-01', to: today };
 }
 
 function applyRowFilters(rows) {
@@ -295,7 +320,7 @@ function applyRowFilters(rows) {
     if (r.event_date < from || r.event_date > to) return false;
     if (filterState.country !== 'all' && r.country !== filterState.country) return false;
     if (filterState.impact !== 'all' && r.impact !== filterState.impact) return false;
-    if (filterState.tradeableOnly && (r.pip_5m == null || r.pip_5m < 10)) return false;
+    if (filterState.tradeableOnly && (r.post_entry_5_30 == null || r.post_entry_5_30 < 10)) return false;
     return true;
   });
 }
@@ -308,32 +333,44 @@ function aggregateAnalysis(rows) {
     const p5 = evs.filter(e => e.pip_5m != null).map(e => e.pip_5m);
     const p15 = evs.filter(e => e.pip_15m != null).map(e => e.pip_15m);
     const p30 = evs.filter(e => e.pip_30m != null).map(e => e.pip_30m);
+    const pe30 = evs.filter(e => e.post_entry_5_30 != null).map(e => e.post_entry_5_30);
+    const heat = evs.filter(e => e.max_adverse_5_30 != null).map(e => e.max_adverse_5_30);
+    // Direction stats: solo rows only (is_co_released = false or null)
+    const soloEvs = evs.filter(e => !e.is_co_released);
+    const soloCount = soloEvs.length;
     let beat = 0, miss = 0, beat_up = 0, beat_down = 0, miss_up = 0, miss_down = 0;
-    evs.forEach(e => {
+    soloEvs.forEach(e => {
       if (e.beat_miss === 'beat') { beat++; if (e.direction_5m === 'up') beat_up++; else if (e.direction_5m === 'down') beat_down++; }
       if (e.beat_miss === 'miss') { miss++; if (e.direction_5m === 'up') miss_up++; else if (e.direction_5m === 'down') miss_down++; }
     });
     const avg5 = avg(p5);
+    const avgPe = avg(pe30);
     let beat_direction = null, beat_consistency = null, miss_direction = null, miss_consistency = null;
     if (beat > 0) { beat_direction = beat_up > beat_down ? 'up' : 'down'; beat_consistency = Math.round(Math.max(beat_up, beat_down) / beat * 100); }
     if (miss > 0) { miss_direction = miss_up > miss_down ? 'up' : 'down'; miss_consistency = Math.round(Math.max(miss_up, miss_down) / miss * 100); }
-    return { your_name, country: evs[0].country, impact: evs[0].impact, total_occurrences: evs.length,
+    return { your_name, country: evs[0].country, impact: evs[0].impact,
+      total_occurrences: evs.length, solo_count: soloCount, co_released_count: evs.length - soloCount,
       avg_pip_5m: avg5, avg_pip_15m: avg(p15), avg_pip_30m: avg(p30),
-      beat_direction, beat_consistency, miss_direction, miss_consistency, tradeable: (avg5 || 0) >= 10 };
-  }).sort((a, b) => (b.avg_pip_5m || 0) - (a.avg_pip_5m || 0));
+      avg_post_entry_5_30: avgPe, avg_max_adverse: avg(heat),
+      beat_direction, beat_consistency, miss_direction, miss_consistency,
+      tradeable: (avgPe || 0) >= 10 };
+  }).sort((a, b) => (b.avg_post_entry_5_30 || b.avg_pip_5m || 0) - (a.avg_post_entry_5_30 || a.avg_pip_5m || 0));
 }
 
 function whatThisMeans(ev) {
-  const avg5 = ev.avg_pip_5m || 0;
+  if (ev.avg_post_entry_5_30 == null) {
+    return `<span style="color:var(--text3);font-style:italic">No post-entry data yet — run Sync Now.</span>`;
+  }
+  const pe = ev.avg_post_entry_5_30;
   const beatC = ev.beat_consistency || 0;
   const missC = ev.miss_consistency || 0;
   const bestC = Math.max(beatC, missC);
   const scenario = beatC >= missC ? 'beat' : 'miss';
   const dir = scenario === 'beat' ? ev.beat_direction : ev.miss_direction;
   const arrow = dir === 'up' ? '▲' : '▼';
-  if (avg5 >= 15 && bestC >= 70) return `Strong trade. ${scenario.charAt(0).toUpperCase() + scenario.slice(1)} → ${arrow} ${bestC}% of the time.`;
-  if (avg5 >= 10 && bestC >= 60) return `Tradeable with caution. Watch for ${dir} on ${scenario}.`;
-  return 'Low power — skip unless exceptional reaction.';
+  if (pe >= 15 && bestC >= 70) return `Strong trade. ${scenario.charAt(0).toUpperCase()+scenario.slice(1)} → ${arrow} ${bestC}% of the time, with <span class="mono">${pe.toFixed(1)}p</span> available after a 5-min entry.`;
+  if (pe >= 8 && bestC >= 60) return `Tradeable with caution. Only <span class="mono">${pe.toFixed(1)}p</span> available after entry — keep targets modest.`;
+  return `Most of the move happens before you enter. Only <span class="mono">${pe.toFixed(1)}p</span> left after 5 minutes. Skip.`;
 }
 
 function countryBadge(c) {
@@ -358,8 +395,8 @@ function renderFilterBar(refreshFn) {
     <div class="form-group"><label>Date Range</label>
       <select onchange="filterState.range=this.value;${refreshFn}()">
         <option value="all" ${filterState.range==='all'?'selected':''}>All Time</option>
-        <option value="after_trump" ${filterState.range==='after_trump'?'selected':''}>After Trump (Jan 20 2025+)</option>
-        <option value="before_trump" ${filterState.range==='before_trump'?'selected':''}>Before Trump (to Jan 19 2025)</option>
+        <option value="after_trump" ${filterState.range==='after_trump'?'selected':''}>Post-Trump (Jan 20 2025+)</option>
+        <option value="post_covid" ${filterState.range==='post_covid'?'selected':''}>Post-Covid (Mar 2020+)</option>
         <option value="custom" ${filterState.range==='custom'?'selected':''}>Custom</option>
       </select></div>
     ${custom}
@@ -375,7 +412,10 @@ function renderFilterBar(refreshFn) {
         <option value="red" ${filterState.impact==='red'?'selected':''}>Red only</option>
         <option value="orange" ${filterState.impact==='orange'?'selected':''}>Orange only</option>
       </select></div>
-    <label class="filter-toggle"><input type="checkbox" ${filterState.tradeableOnly?'checked':''} onchange="filterState.tradeableOnly=this.checked;${refreshFn}()"> Tradeable only (10p+ 5M)</label>
+    <label class="filter-toggle"><input type="checkbox" ${filterState.tradeableOnly?'checked':''} onchange="filterState.tradeableOnly=this.checked;${refreshFn}()"> Tradeable only (10p+ post-entry)</label>
+  </div>
+  <div style="font-size:11px;color:var(--text3);margin-bottom:16px;margin-top:-10px;padding:0 4px">
+    💡 Different periods behave differently. Post-Covid changed how FX reacts to economic data. Comparing 2019 with 2021 mixes two regimes.
   </div>`;
 }
 
@@ -393,6 +433,7 @@ async function render() {
   m.innerHTML = '<div class="empty-state">Loading...</div>';
   try {
     if      (page === 'thisweek')  await renderThisWeek();
+    else if (page === 'livetrades') await renderLiveTrades();
     else if (page === 'dashboard') await renderDash();
     else if (page === 'performance') await renderPerformance();
     else if (page === 'analysis')  await renderAnalysis();
@@ -401,9 +442,211 @@ async function render() {
     else if (page === 'log')       await renderLog();
     else if (page === 'newscheck') await renderNewsCheck();
     else if (page === 'settings')  await renderSettings();
+    else if (page === 'blueprint') renderBlueprint();
   } catch(e) {
     m.innerHTML = `<div class="empty-state" style="color:var(--red)">Error: ${e.message}<br><br>Make sure app.py is running.</div>`;
   }
+}
+
+// ── LIVE TRADES ───────────────────────────────────────────
+function calcLots(balance, riskPct, slPips, rate) {
+  if (!balance || !riskPct || !slPips || !rate) return null;
+  const pipValueGbpPerLot = 10 / rate;
+  const riskAmount = balance * riskPct / 100;
+  return { lots: riskAmount / (slPips * pipValueGbpPerLot), riskAmount, pipValueGbpPerLot };
+}
+
+function renderDrawdownTable(balance, riskPct, startingBalance) {
+  const rows = [1,3,5,10].map(n => {
+    const remaining = balance * Math.pow(1 - riskPct/100, n);
+    const gain = (balance - remaining) / remaining * 100;
+    const danger = remaining < startingBalance * 0.7;
+    return `<tr>
+      <td>${n}</td>
+      <td class="${danger ? 'danger-balance' : ''}">${remaining.toFixed(0)}</td>
+      <td>${gain.toFixed(1)}%</td>
+    </tr>`;
+  }).join('');
+  return `<table class="drawdown-table">
+    <tr><th>Losses in a row</th><th>Balance left</th><th>Gain to recover</th></tr>
+    ${rows}
+  </table>`;
+}
+
+function renderPositionCalc(cfg, currentRate, containerId, prefillSl) {
+  const sl = prefillSl || cfg.suggested_sl || 15;
+  const balance = parseFloat(cfg.starting_balance || '5000');
+  const riskPct = parseFloat(cfg.default_risk_pct || '2');
+  const currency = cfg.account_currency || 'GBP';
+  const riskPctWarning = riskPct > 10
+    ? `<div id="calc-risk-overlay" style="font-size:12px;color:var(--text2);margin-top:8px">
+        ⚠ Risk over 10% — <a href="#" onclick="document.getElementById('calc-lots-result').style.display='block';document.getElementById('calc-risk-overlay').style.display='none';return false" style="color:var(--accent)">I understand, show anyway</a></div>`
+    : '';
+  const dailyLimitPct = parseFloat(cfg.daily_loss_limit_pct || '6');
+  const consistencyWarn = riskPct > dailyLimitPct
+    ? `<div class="consistency-warn">Your per-trade risk (<span class="mono">${riskPct}%</span>) is larger than your daily loss limit (<span class="mono">${dailyLimitPct}%</span>). A single losing trade would end your trading day. Set the daily limit to at least 2× your per-trade risk.</div>`
+    : '';
+
+  return `<div class="card" style="margin-top:20px">
+    <div class="card-title">Position Size Calculator</div>
+    ${consistencyWarn}
+    <div class="form-grid-3" style="margin-bottom:14px">
+      <div class="form-group">
+        <label>Account Balance (${currency})</label>
+        <input type="number" id="calc-balance" value="${balance.toFixed(0)}" oninput="updateCalc('${containerId}','${currency}',${balance})">
+      </div>
+      <div class="form-group">
+        <label>Risk %</label>
+        <input type="number" id="calc-risk" value="${riskPct}" step="0.5" min="0.1" oninput="updateCalc('${containerId}','${currency}',${balance})">
+      </div>
+      <div class="form-group">
+        <label>Stop Loss (pips, min 15)</label>
+        <input type="number" id="calc-sl" value="${sl}" min="1" oninput="updateCalc('${containerId}','${currency}',${balance})">
+      </div>
+    </div>
+    <div id="calc-sl-warn" class="risk-warn amber" style="display:none">⚠ Stops under 15 pips are risky on news releases. Spread can widen to 5-15 pips and stop you out before price moves.</div>
+    <div id="calc-lots-result" style="${riskPct > 10 ? 'display:none' : ''}">
+      <div class="calc-result" id="${containerId}-result">—</div>
+      <div id="${containerId}-sub" style="font-size:12px;color:var(--text2);margin-bottom:10px"></div>
+    </div>
+    ${riskPctWarning}
+    <div id="${containerId}-risk-warn"></div>
+    <details style="margin-top:12px">
+      <summary style="font-size:11px;color:var(--text2);cursor:pointer;user-select:none">Drawdown table</summary>
+      <div id="${containerId}-drawdown">${renderDrawdownTable(balance, riskPct, balance)}</div>
+    </details>
+    <div style="font-size:11px;color:var(--text3);margin-top:10px">Rate: <span class="mono">${currentRate ? currentRate.toFixed(5) : '—'}</span></div>
+  </div>`;
+}
+
+let _calcRate = null;
+function updateCalc(containerId, currency, startingBalance) {
+  const balanceEl = document.getElementById('calc-balance');
+  const riskEl = document.getElementById('calc-risk');
+  const slEl = document.getElementById('calc-sl');
+  if (!balanceEl || !riskEl || !slEl) return;
+  const balance = parseFloat(balanceEl.value) || 0;
+  const riskPct = parseFloat(riskEl.value) || 0;
+  const slPips = parseFloat(slEl.value) || 0;
+  const slWarn = document.getElementById('calc-sl-warn');
+  if (slWarn) slWarn.style.display = slPips < 15 && slPips > 0 ? 'block' : 'none';
+  const rate = _calcRate;
+  const resultEl = document.getElementById(containerId + '-result');
+  const subEl = document.getElementById(containerId + '-sub');
+  const riskWarnEl = document.getElementById(containerId + '-risk-warn');
+  const drawdownEl = document.getElementById(containerId + '-drawdown');
+  if (resultEl) {
+    const c = calcLots(balance, riskPct, slPips, rate);
+    if (c) {
+      resultEl.textContent = `Risk ${currency}${c.riskAmount.toFixed(2)} → ${c.lots.toFixed(2)} lots`;
+      if (subEl) subEl.textContent = `If price hits your stop you lose ${currency}${c.riskAmount.toFixed(2)}, which is ${riskPct}% of your account.`;
+    } else {
+      resultEl.textContent = '—';
+    }
+    if (riskWarnEl) {
+      if (riskPct > 3) {
+        const afterFive = balance * Math.pow(1 - riskPct/100, 5);
+        const recoveryNeeded = (balance - afterFive) / afterFive * 100;
+        riskWarnEl.innerHTML = `<div class="risk-warn ${riskPct > 5 ? 'red' : 'amber'}">At ${riskPct}% per trade, five losses in a row leaves you with ${currency}${afterFive.toFixed(0)} and you would need a ${recoveryNeeded.toFixed(1)}% gain to recover. Professional traders risk 1–2%.</div>`;
+      } else {
+        riskWarnEl.innerHTML = '';
+      }
+    }
+    if (drawdownEl) drawdownEl.innerHTML = renderDrawdownTable(balance, riskPct, startingBalance);
+  }
+}
+
+async function renderLiveTrades() {
+  const m = document.getElementById('main');
+  m.innerHTML = '<div class="empty-state">Loading...</div>';
+  const [trades, cfg, rateData, status] = await Promise.all([
+    GET('/trades?trade_type=live').catch(() => []),
+    GET('/settings').catch(() => ({})),
+    GET('/oanda/current-price').catch(() => ({})),
+    GET('/daily-status').catch(() => ({})),
+  ]);
+  _calcRate = rateData.price || null;
+  const currency = cfg.account_currency || 'GBP';
+  const startingBalance = parseFloat(cfg.starting_balance || '5000');
+  const currentBalance = status.current_balance ?? startingBalance;
+  const totalPnl = status.today_pnl !== undefined ? (trades.reduce((s,t) => s + (t.pnl||0), 0)) : 0;
+  const allPnl = trades.reduce((s,t) => s + (t.pnl||0), 0);
+  const wins = trades.filter(t => t.outcome === 'Win');
+  const losses = trades.filter(t => t.outcome === 'Loss');
+  const today = new Date().toISOString().split('T')[0];
+  const todayTrades = trades.filter(t => t.date === today);
+  const todayPnl = todayTrades.reduce((s,t) => s + (t.pnl||0), 0);
+  const winRate = trades.length ? Math.round(wins.length/trades.length*100) : 0;
+  const returnPct = startingBalance ? (allPnl/startingBalance*100).toFixed(1) : '0.0';
+
+  // Daily limit banner
+  let bannerHtml = '';
+  if (status.daily_limit_hit) {
+    bannerHtml = `<div class="limit-banner red">🛑 DAILY LOSS LIMIT REACHED — STOP TRADING TODAY.<br>
+      You are down <span class="mono">${currency}${Math.abs(todayPnl).toFixed(2)}</span> today (<span class="mono">${status.daily_limit_pct}%</span> of account). There will be another trade tomorrow.</div>`;
+  } else if (status.trade_limit_hit) {
+    bannerHtml = `<div class="limit-banner amber">⚠ TRADE LIMIT REACHED — <span class="mono">${status.today_count}</span> trades taken today.</div>`;
+  } else {
+    bannerHtml = `<div class="limit-banner green">✓ OK to trade. <span class="mono">${currency}${(status.remaining_before_limit||0).toFixed(2)}</span> remaining before daily loss limit. <span class="mono">${status.today_count||0}</span> of <span class="mono">${status.max_trades||3}</span> trades used.</div>`;
+  }
+
+  const pnlSign = allPnl >= 0 ? '+' : '';
+  const tableRows = trades.length ? trades.map(t => {
+    const pnl = t.pnl != null ? `<span class="mono" style="color:${t.pnl>=0?'var(--green)':'var(--red)'}">${t.pnl>=0?'+':''}${currency}${Math.abs(t.pnl||0).toFixed(2)}</span>` : '—';
+    const events = [t.news1,t.news2,t.news3].filter(Boolean).map(n=>`<span class="news-tag">${n.replace(/ US$| UK$/,'')}</span>`).join('');
+    return `<tr>
+      <td class="mono" style="font-size:11px">${t.date}</td>
+      <td>${events}</td>
+      <td><span class="badge ${t.direction==='BUY'?'win':'loss'}">${t.direction||'—'}</span></td>
+      <td class="mono">${t.entry_price?t.entry_price.toFixed(5):'—'}</td>
+      <td class="mono">${t.exit_price?t.exit_price.toFixed(5):'—'}</td>
+      <td class="mono">${t.lot_size?t.lot_size.toFixed(2)+'L':'—'}</td>
+      <td class="mono">${t.sl?t.sl+'p':'—'}</td>
+      <td class="mono">${t.spread_at_entry?t.spread_at_entry.toFixed(1)+'p':'—'}</td>
+      <td class="mono">${t.risk_amount?currency+t.risk_amount.toFixed(2):'—'}</td>
+      <td>${pnl}</td>
+      <td><span class="badge ${t.outcome==='Win'?'win':'loss'}">${t.outcome.toUpperCase()}</span></td>
+      <td class="td-notes">${t.improvement||''}</td>
+      <td><button class="delete-btn" onclick="deleteLiveTrade(${t.id})">✕</button></td>
+    </tr>`;
+  }).join('') : `<tr><td colspan="13" class="empty-state">No live trades yet. Start trading tomorrow and log your first real position.</td></tr>`;
+
+  const calcHtml = renderPositionCalc(cfg, _calcRate, 'main-calc', 15);
+
+  m.innerHTML = `
+    <div class="page-header"><div class="page-title">Live Trades</div><div class="page-sub">Real-money positions · ${currency} account</div></div>
+    ${bannerHtml}
+    <div class="stats-grid">
+      <div class="stat-card"><div class="stat-label">Account Balance</div>
+        <div class="stat-value ${allPnl>=0?'green':'red'}" style="font-size:22px"><span class="mono">${currency}${currentBalance.toFixed(2)}</span></div>
+        <div class="stat-sub">Started at <span class="mono">${currency}${startingBalance.toFixed(0)}</span></div></div>
+      <div class="stat-card"><div class="stat-label">Total P&amp;L</div>
+        <div class="stat-value ${allPnl>=0?'green':'red'}"><span class="mono">${pnlSign}${currency}${Math.abs(allPnl).toFixed(2)}</span></div>
+        <div class="stat-sub"><span class="mono">${returnPct}%</span> return</div></div>
+      <div class="stat-card"><div class="stat-label">Today</div>
+        <div class="stat-value ${todayPnl>=0?'green':'red'}" style="font-size:22px"><span class="mono">${todayPnl>=0?'+':''}${currency}${Math.abs(todayPnl).toFixed(2)}</span></div>
+        <div class="stat-sub"><span class="mono">${todayTrades.length}</span> of <span class="mono">${status.max_trades||3}</span> trades used</div></div>
+      <div class="stat-card"><div class="stat-label">Win Rate (Live)</div>
+        <div class="stat-value ${winRate>=50?'green':'red'}"><span class="mono">${winRate}%</span></div>
+        <div class="stat-sub"><span class="mono">${wins.length}</span>W / <span class="mono">${losses.length}</span>L</div></div>
+    </div>
+    ${calcHtml}
+    <div class="card" style="margin-top:20px">
+      <div class="card-title">Live Trade Log — newest first</div>
+      <div class="table-wrap"><table>
+        <tr><th>Date</th><th>Events</th><th>Dir</th><th>Entry</th><th>Exit</th><th>Lots</th><th>SL</th><th>Spread</th><th>Risk</th><th>P&amp;L</th><th>Result</th><th>Notes</th><th></th></tr>
+        ${tableRows}
+      </table></div>
+    </div>`;
+  // Trigger initial calc render
+  setTimeout(() => updateCalc('main-calc', currency, startingBalance), 50);
+}
+
+async function deleteLiveTrade(id) {
+  if (!confirm('Delete this live trade?')) return;
+  await DEL('/trades/' + id);
+  toast('Trade deleted', 'success');
+  await renderLiveTrades();
 }
 
 // ── DASHBOARD ─────────────────────────────────────────────
@@ -649,9 +892,13 @@ function localDateStr(dt) {
 
 async function renderThisWeek() {
   const m = document.getElementById('main');
-  m.innerHTML = `<div class="page-header"><div class="page-title">This Week</div><div class="page-sub">Upcoming USD &amp; GBP news &middot; next 7 days</div></div><div class="empty-state">Loading upcoming events...</div>`;
-  const data = await GET('/upcoming');
+  m.innerHTML = `<div class="page-header"><div class="page-title">This Week</div><div class="page-sub">Upcoming USD &amp; GBP news &middot; next 7 days · Forex Factory calendar</div></div><div class="empty-state">Loading upcoming events...</div>`;
+  const [data, ratingList] = await Promise.all([GET('/upcoming?refresh=1'), GET('/ratings').catch(() => [])]);
+  ratings = ratingList || [];
+  const ratingMap = {};
+  ratings.forEach(r => { ratingMap[r.name] = r; });
   const events = data.events || [];
+  thisWeekEventsCache = events;
   const byDay = {};
   events.forEach(ev => { (byDay[ev.event_date] = byDay[ev.event_date] || []).push(ev); });
   const dayNames = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
@@ -662,24 +909,65 @@ async function renderThisWeek() {
     const d = localDateStr(dt);
     const label = `${dayNames[dt.getDay()]} · <span class="mono">${d}</span>`;
     if (!byDay[d] || byDay[d].length === 0) {
-      sections.push(`<div class="day-header">${label}</div><div style="font-size:12px;color:var(--text3);padding:8px 0 12px">No tracked events today.</div>`);
+      sections.push(`<div class="day-header">${label}</div><div style="font-size:12px;color:var(--text3);padding:8px 0 12px">No USD/GBP high-impact events today.</div>`);
     } else {
-      const rows = byDay[d].map(ev => `
+      // Detect same-time groups (watchlist events within 30 min of each other)
+      const dayWatched = byDay[d].filter(ev => ev.on_watchlist && ev.your_name && ev.event_time);
+      const timeGroups = {};
+      dayWatched.forEach(ev => {
+        const t = ev.event_time;
+        if (!timeGroups[t]) timeGroups[t] = [];
+        timeGroups[t].push(ev);
+      });
+      const multiGroupByName = {};
+      Object.values(timeGroups).filter(g => g.length >= 2).forEach(g =>
+        g.forEach(ev => { multiGroupByName[ev.your_name] = g; })
+      );
+      const rows = byDay[d].map(ev => {
+        const mapped = ev.on_watchlist && ev.your_name;
+        const note = mapped ? ratingMap[ev.your_name] : null;
+        const noteBadge = note ? briefRatingBadge(note.type) : '';
+        const multiGroup = mapped ? multiGroupByName[ev.your_name] : null;
+        const multiTag = multiGroup ? `<span class="multi-event-tag">⚠ Multi-event release — open together</span>` : '';
+        const mapLine = mapped
+          ? `<div style="font-size:10px;color:var(--text3);margin-top:2px">Your map: ${ev.your_name.replace(/ US$| UK$/,'')}${noteBadge}${note && note.comment ? ` · <span style="font-style:italic">${note.comment}</span>` : ''}</div>`
+          : `<div style="font-size:10px;color:var(--text3);margin-top:2px">Not on watchlist yet</div>`;
+        let briefBtn;
+        if (!mapped) {
+          briefBtn = `<button class="btn btn-secondary" style="padding:6px 12px;font-size:11px" disabled title="Not mapped to your watchlist">No brief</button>`;
+        } else if (multiGroup) {
+          const groupNames = JSON.stringify(multiGroup.map(e => e.your_name));
+          briefBtn = `<div style="display:flex;gap:6px;flex-wrap:wrap">
+            <button class="btn btn-blue" style="padding:6px 12px;font-size:11px" onclick='showBrief(${JSON.stringify(ev.your_name)})'>Pre-Trade Brief</button>
+            <button class="btn btn-primary" style="padding:6px 12px;font-size:11px" onclick='showCombinedBrief(${groupNames.replace(/'/g,"\\'")})'  >Combined Brief</button>
+          </div>`;
+        } else {
+          briefBtn = `<button class="btn btn-blue" style="padding:6px 12px;font-size:11px" onclick='showBrief(${JSON.stringify(ev.your_name)})'>Pre-Trade Brief</button>`;
+        }
+        return `
         <div class="upcoming-row">
-          <span class="mono" style="color:var(--text2)">${ev.event_time || '—'}</span>
-          <div><div style="font-weight:600">${ev.your_name.replace(/ US$| UK$/,'')}</div>${countryBadge(ev.country)}</div>
+          <span class="mono" style="color:var(--text2)">${ev.event_time || '—'}${multiTag}</span>
+          <div>
+            <div style="font-weight:600">${ev.ff_title || ev.your_name || '—'}</div>
+            ${countryBadge(ev.country)}
+            ${mapLine}
+          </div>
           <span><span class="badge ${ev.impact==='red'?'loss':'caution'}">${(ev.impact||'—').toUpperCase()}</span></span>
           <span class="mono" style="font-size:11px">${ev.previous||'—'}</span>
           <span class="mono" style="font-size:11px">${ev.forecast||'—'}</span>
           <span></span><span></span>
-          <button class="btn btn-blue" style="padding:6px 12px;font-size:11px" onclick='showBrief(${JSON.stringify(ev.your_name)})'>Pre-Trade Brief</button>
-        </div>`).join('');
+          ${briefBtn}
+        </div>`;
+      }).join('');
       sections.push(`<div class="day-header">${label}</div>${rows}`);
     }
   }
-  const body = sections.length ? `<div class="card">${sections.join('')}</div>` : '<div class="card"><div class="empty-state">No tracked events in the next 7 days.</div></div>';
+  const body = sections.length ? `<div class="card">${sections.join('')}</div>` : '<div class="card"><div class="empty-state">No USD/GBP high-impact events in the next 7 days.</div></div>';
   const sourceNote = data.source === 'database' ? ' · from synced data' : '';
-  m.innerHTML = `<div class="page-header"><div class="page-title">This Week</div><div class="page-sub">Upcoming USD &amp; GBP news &middot; next 7 days${data.cached?' · cached':''}${sourceNote}</div></div>${body}
+  const warnBanner = (data.warning || data.error)
+    ? `<div style="background:var(--amber-dim);border:1px solid var(--amber);border-radius:8px;padding:12px 16px;margin-bottom:16px;font-size:12px;color:var(--amber)">${data.warning || data.error}</div>`
+    : '';
+  m.innerHTML = `<div class="page-header"><div class="page-title">This Week</div><div class="page-sub">Upcoming USD &amp; GBP news &middot; next 7 days${data.cached?' · cached':''}${sourceNote}</div></div>${warnBanner}${body}
     <div style="margin-top:12px"><button class="btn btn-secondary" onclick="renderThisWeek()">↻ Refresh</button></div>`;
 }
 
@@ -700,6 +988,97 @@ async function showBrief(eventName) {
     if (b.error) { overlay.querySelector('.modal-box').innerHTML = `<div style="color:var(--red)">${b.error}</div>`; return; }
     overlay.querySelector('.modal-box').innerHTML = renderBriefModal(b);
     initLiveAssistant(b);
+  } catch(e) {
+    overlay.querySelector('.modal-box').innerHTML = `<div style="color:var(--red)">Error: ${e.message}</div>`;
+  }
+}
+
+async function showCombinedBrief(eventNames) {
+  stopLiveAssistant();
+  const existing = document.getElementById('brief-modal');
+  if (existing) existing.remove();
+  const overlay = document.createElement('div');
+  overlay.id = 'brief-modal';
+  overlay.className = 'modal-overlay';
+  overlay.innerHTML = `<div class="modal-box brief-modal-box"><div class="empty-state">Loading combined brief...</div></div>`;
+  document.body.appendChild(overlay);
+  overlay.addEventListener('click', e => { if (e.target === overlay) { stopLiveAssistant(); overlay.remove(); } });
+  try {
+    const names = Array.isArray(eventNames) ? eventNames : JSON.parse(eventNames);
+    const groupQuery = names.map(n => 'events=' + encodeURIComponent(n)).join('&');
+    const [briefs, groupData] = await Promise.all([
+      Promise.all(names.map(n => GET('/brief/' + encodeURIComponent(n)).catch(e => ({ error: e.message, event_name: n })))),
+      GET('/group-brief?' + groupQuery).catch(() => ({ total_occurrences: 0, has_sufficient_data: false, scenarios: [] })),
+    ]);
+    const valid = briefs.filter(b => !b.error);
+    if (!valid.length) { overlay.querySelector('.modal-box').innerHTML = `<div style="color:var(--red)">Could not load any briefs.</div>`; return; }
+    const primary = valid[0];
+
+    // Build the historical section based on data availability
+    let historicalSection = '';
+    if (groupData.has_sufficient_data) {
+      // Case A: 8+ joint occurrences — show co-occurrence table
+      const reliabilityClr = c => c >= 70 ? 'var(--green)' : c >= 55 ? 'var(--amber)' : 'var(--red)';
+      const dirCell = dir => dir === 'up'
+        ? `<span class="dir-up">▲</span> <span style="color:var(--green)">BUY GBP/USD</span>`
+        : `<span class="dir-down">▼</span> <span style="color:var(--red)">SELL GBP/USD</span>`;
+      const scRows = (groupData.scenarios || []).map(s => {
+        const muted = s.count < 3;
+        const sampleTag = muted ? `<span style="font-size:10px;color:var(--text3);margin-left:6px">SMALL SAMPLE</span>` : '';
+        return `<tr style="${muted ? 'opacity:0.55' : ''}">
+          <td style="font-size:11px">${s.label}${sampleTag}</td>
+          <td class="mono" style="font-size:11px">${s.count}</td>
+          <td style="font-size:11px">${dirCell(s.direction)}</td>
+          <td class="mono" style="font-size:11px">${s.avg_pip_5m != null ? s.avg_pip_5m.toFixed(1)+'p' : '—'}</td>
+          <td class="mono" style="font-size:11px">${s.avg_pip_15m != null ? s.avg_pip_15m.toFixed(1)+'p' : '—'}</td>
+          <td class="mono" style="font-size:11px;color:${reliabilityClr(s.consistency)}">${s.consistency}%</td>
+        </tr>`;
+      }).join('');
+      historicalSection = `<div class="brief-section">
+        <div class="brief-section-title">What Happens When These Release Together</div>
+        <div style="font-size:12px;color:var(--text2);margin-bottom:12px;line-height:1.6">
+          These <span class="mono">${groupData.total_occurrences}</span> events always release at the same time, so this table shows the real combined market reaction rather than each event measured separately.
+        </div>
+        <div class="table-wrap"><table>
+          <tr><th>Scenario</th><th>Times Seen</th><th>Direction</th><th>Avg 5M</th><th>Avg 15M</th><th>Reliability</th></tr>
+          ${scRows || '<tr><td colspan="6" class="empty-state">No scenario data yet</td></tr>'}
+        </table></div>
+      </div>`;
+    } else {
+      // Case B: fewer than 8 joint occurrences — side-by-side decision trees
+      const n = groupData.total_occurrences || 0;
+      const note = n > 0
+        ? `<div style="font-size:12px;color:var(--amber);margin-bottom:12px;line-height:1.6">These events have only released together <span class="mono">${n}</span> time${n !== 1 ? 's' : ''} in the recorded history, so each is analysed separately and the stronger signal is followed.</div>`
+        : '';
+      historicalSection = `<div class="brief-section">
+        <div class="brief-section-title">Decision Trees — Side by Side</div>
+        ${note}
+        <div style="display:grid;grid-template-columns:repeat(${valid.length},1fr);gap:16px;margin-bottom:16px">
+          ${valid.map(b => `<div>
+            <div style="font-size:11px;font-weight:700;color:var(--text2);margin-bottom:8px">${b.event_name.replace(/ US$| UK$/,'')} ${countryBadge(b.country)}</div>
+            ${briefDirBox('beat', b.beat_direction, b.beat_consistency, b.beat_count)}
+            <div style="margin-top:8px"></div>
+            ${briefDirBox('miss', b.miss_direction, b.miss_consistency, b.miss_count)}
+          </div>`).join('')}
+        </div>
+      </div>`;
+    }
+
+    const html = `<div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:16px">
+      <div><div class="modal-title">Combined Brief — ${names.map(n=>n.replace(/ US$| UK$/,'')).join(' + ')}</div>
+      <div style="font-size:12px;color:var(--text2);margin-top:6px">
+        ${valid.map(b=>`${countryBadge(b.country)} <span class="mono">${b.event_name.replace(/ US$| UK$/,'')}</span> · Forecast: <span class="mono">${b.forecast||'—'}</span>`).join('&nbsp;&nbsp;·&nbsp;&nbsp;')}
+      </div></div>
+      <button class="delete-btn" onclick="closeBriefModal()">✕</button>
+    </div>
+    <div class="brief-section live-assistant-wrap">
+      <div class="brief-section-title">Live Trade Assistant</div>
+      <div id="live-assistant-panel"></div>
+    </div>
+    ${historicalSection}`;
+
+    overlay.querySelector('.modal-box').innerHTML = html;
+    initLiveAssistant(primary, valid.slice(1), groupData);
   } catch(e) {
     overlay.querySelector('.modal-box').innerHTML = `<div style="color:var(--red)">Error: ${e.message}</div>`;
   }
@@ -749,10 +1128,14 @@ function renderBriefModal(b) {
   const s = b.stats || {};
   const n = s.total_occurrences || 0;
   const avg5 = b.avg_pip_5m != null ? b.avg_pip_5m : 0;
+  const avgPe = b.avg_post_entry_5_30 != null ? b.avg_post_entry_5_30 : null;
+  const avgHeat = b.avg_heat != null ? b.avg_heat : null;
+  const soloCount = b.solo_count != null ? b.solo_count : n;
+  const coPartner = b.co_partner || null;
   const minP = b.min_pip_5m != null ? b.min_pip_5m : '—';
   const maxP = b.max_pip_5m != null ? b.max_pip_5m : '—';
   const fc = b.forecast || '—';
-  const sl = b.suggested_sl || 10;
+  const sl = b.suggested_sl || 15;
   const rr = b.suggested_rr || 5;
   const tp = Math.round(sl * rr);
   const hist = b.user_history || {};
@@ -767,8 +1150,10 @@ function renderBriefModal(b) {
   </div>`;
 
   const warnings = [];
-  if (avg5 < 10) warnings.push('⚠ LOW POWER WARNING: This event often doesn\'t move enough to hit a 1:5 target. Skip unless reaction is exceptional (15p+ in first 2 minutes).');
+  const peOrFallback = avgPe != null ? avgPe : avg5;
+  if (peOrFallback < 8) warnings.push('⚠ LOW POST-ENTRY POWER: Most of the move happens before you enter. Only ' + (avgPe != null ? avgPe.toFixed(1) : avg5.toFixed(1)) + 'p available after a 5-min entry. Skip unless reaction is exceptional.');
   if (maxCons < 60 && maxCons > 0) warnings.push('⚠ UNPREDICTABLE DIRECTION: This event is hard to call. Consider skipping or use much smaller position size.');
+  if (soloCount < 5 && coPartner) warnings.push(`⚠ FEW SOLO OCCURRENCES: This event nearly always releases alongside ${coPartner}. Direction stats may be unreliable. Use the Combined Brief instead.`);
   if (b.rating_comment) warnings.push(`📌 Your own note: ${b.rating_comment}`);
   if (b.same_day_events && b.same_day_events.length) {
     const names = b.same_day_events.map(n => n.replace(/ US$| UK$/,'')).join(', ');
@@ -817,17 +1202,23 @@ function renderBriefModal(b) {
 
     <div class="brief-section">
       <div class="brief-section-title">Decision Tree — What To Do When Data Releases</div>
-      <div class="brief-decision-grid">
-        ${briefDirBox('beat', b.beat_direction, b.beat_consistency, b.beat_count)}
-        ${matchBox}
-        ${briefDirBox('miss', b.miss_direction, b.miss_consistency, b.miss_count)}
-      </div>
-      <div style="font-size:12px;color:var(--text2);line-height:1.7">
-        <strong>How to use this:</strong> When the news releases, compare the ACTUAL number against the FORECAST of <span class="mono">${fc}</span>.<br>
-        &bull; If actual is significantly higher than <span class="mono">${fc}</span> → use the BEATS box<br>
-        &bull; If actual is significantly lower than <span class="mono">${fc}</span> → use the MISSES box<br>
-        &bull; If actual is within 5% of <span class="mono">${fc}</span> → treat as MATCH and skip
-      </div>
+      ${soloCount < 5 && coPartner
+        ? `<div style="background:var(--amber-dim);border:1px solid var(--amber);border-radius:8px;padding:14px;font-size:12px;color:var(--amber)">
+            ⚠ <strong>This event nearly always releases alongside ${coPartner}.</strong><br>
+            Individual direction stats are based on fewer than 5 solo occurrences and are unreliable.
+            Open the <strong>Combined Brief</strong> via the Live Trade Assistant for accurate co-release data.
+           </div>`
+        : `<div class="brief-decision-grid">
+            ${briefDirBox('beat', b.beat_direction, b.beat_consistency, b.beat_count)}
+            ${matchBox}
+            ${briefDirBox('miss', b.miss_direction, b.miss_consistency, b.miss_count)}
+          </div>
+          <div style="font-size:12px;color:var(--text2);line-height:1.7">
+            <strong>How to use this:</strong> When the news releases, compare the ACTUAL number against the FORECAST of <span class="mono">${fc}</span>.<br>
+            &bull; If actual is significantly higher than <span class="mono">${fc}</span> → use the BEATS box<br>
+            &bull; If actual is significantly lower than <span class="mono">${fc}</span> → use the MISSES box<br>
+            &bull; If actual is within 5% of <span class="mono">${fc}</span> → treat as MATCH and skip
+          </div>`}
     </div>
 
     <div class="brief-section">
@@ -843,10 +1234,14 @@ function renderBriefModal(b) {
     <div class="brief-section">
       <div class="brief-section-title">What The Data Says</div>
       <div style="font-size:12px;color:var(--text2);line-height:1.8">
-        This event has released <span class="mono">${n}</span> times since Jan 2020.<br>
-        On average GBP/USD moves <span class="mono">${avg5.toFixed(1)}p</span> in the first 5 minutes after release.<br>
-        Biggest move ever recorded: <span class="mono">${maxP}p</span><br>
-        Smallest move recorded: <span class="mono">${minP}p</span><br><br>
+        This event has released <span class="mono">${n}</span> times since Jan 2020 (<span class="mono">${soloCount}</span> solo, <span class="mono">${n - soloCount}</span> co-released).<br>
+        First 5 minutes: <span class="mono" style="color:var(--text3)">${avg5.toFixed(1)}p</span> <span style="font-size:10px;color:var(--text3)">(not capturable after 5-min wait)</span><br>
+        After a 5-minute entry, this event has historically offered
+        <span class="mono" style="color:${(avgPe||0)>=10?'var(--green)':(avgPe||0)>=5?'var(--amber)':'var(--red)'}">
+          ${avgPe != null ? avgPe.toFixed(1)+'p' : '—'}
+        </span> of further movement,
+        with <span class="mono">${avgHeat != null ? avgHeat.toFixed(1)+'p' : '—'}</span> of heat against you on the way.<br>
+        Biggest 5M move recorded: <span class="mono">${maxP}p</span> &middot; Smallest: <span class="mono">${minP}p</span><br><br>
         <strong>Verdict: <span class="mono">${b.power_verdict || 'LOW-POWER'}</span> event.</strong>
       </div>
     </div>
@@ -859,8 +1254,11 @@ function renderBriefModal(b) {
       <div class="brief-step">✓ <strong>Step 4 — Wait 5 minutes</strong><br>Don't enter immediately. Wait 5 minutes for the initial spike to settle, then confirm the direction is still the same.</div>
       <div class="brief-step">✓ <strong>Step 5 — Enter the trade</strong><br>
         Entry: ${b.suggested_entry}<br>
-        Stop Loss: <span class="mono">${sl}p</span><br>
-        Take Profit: <span class="mono">${tp}p</span> (<span class="mono">1:${rr}</span> R:R)</div>
+        Stop Loss: <span class="mono">${sl}p</span> (based on avg heat × 1.2, min 15p to survive spread widening)<br>
+        ${b.rr_below_1
+          ? `<span style="color:var(--amber)">⚠ R:R below 1:1 historically — this event does not support your usual targets. Consider skipping.</span>`
+          : `Take Profit: <span class="mono">${tp}p</span> (<span class="mono">1:${rr}</span> R:R — data-driven from post-entry move ÷ SL)`
+        }</div>
       <div class="brief-step">✓ <strong>Step 6 — Don't move your SL</strong><br>Whatever happens, do not move your stop loss. If price hits it, accept the loss.</div>
     </div>
 
@@ -897,14 +1295,25 @@ function parseBriefNumber(val) {
   return n;
 }
 
-function calcBeatMissLive(actualStr, forecastStr) {
+function calcBeatMissLive(actualStr, forecastStr, absThreshold = 1.0, valueType = 'percent') {
   const a = parseBriefNumber(actualStr);
   const f = parseBriefNumber(forecastStr);
-  if (a === null || f === null) return { scenario: 'match', percentDiff: 0 };
-  const pct = Math.abs(f) > 0 ? Math.abs(a - f) / Math.abs(f) * 100 : 0;
-  if (pct <= 5) return { scenario: 'match', percentDiff: pct };
-  if (a > f) return { scenario: 'beat', percentDiff: pct };
-  return { scenario: 'miss', percentDiff: pct };
+  if (a === null || f === null) return { scenario: 'match', percentDiff: 0, method: 'proportional' };
+  const diff = a - f;
+  // Use absolute threshold for count_signed series (e.g. Claimant Count Change which crosses zero)
+  // OR as a secondary safety net when signs actually differ
+  const oppositeSigns = (f > 0 && a < 0) || (f < 0 && a > 0);
+  const useAbsolute = (valueType === 'count_signed') || oppositeSigns;
+  if (useAbsolute) {
+    if (diff > absThreshold) return { scenario: 'beat', percentDiff: null, method: 'absolute' };
+    if (diff < -absThreshold) return { scenario: 'miss', percentDiff: null, method: 'absolute' };
+    return { scenario: 'match', percentDiff: null, method: 'absolute' };
+  }
+  // Proportional 5% rule for percent and count_large series
+  const pct = Math.abs(f) > 0 ? Math.abs(diff) / Math.abs(f) * 100 : 0;
+  if (pct <= 5) return { scenario: 'match', percentDiff: pct, method: 'proportional' };
+  if (diff > 0) return { scenario: 'beat', percentDiff: pct, method: 'proportional' };
+  return { scenario: 'miss', percentDiff: pct, method: 'proportional' };
 }
 
 function getLiveRecommendation(brief, scenario) {
@@ -930,56 +1339,275 @@ function formatCountdown(secs) {
   return `${m}:${String(s).padStart(2, '0')}`;
 }
 
-function initLiveAssistant(brief) {
-  liveAssistantState = { brief, stage: 'before' };
+// ── MULTI-EVENT HELPERS ───────────────────────────────────
+function parseEventTimeMinutes(t) {
+  if (!t) return null;
+  const m = t.match(/^(\d+):(\d+)(am|pm)$/i);
+  if (!m) return null;
+  let h = parseInt(m[1]), min = parseInt(m[2]);
+  const ap = m[3].toLowerCase();
+  if (ap === 'pm' && h !== 12) h += 12;
+  if (ap === 'am' && h === 12) h = 0;
+  return h * 60 + min;
+}
+
+function getSameTimeEvents(brief) {
+  const myEv = thisWeekEventsCache.find(e => e.your_name === brief.event_name);
+  if (!myEv || !myEv.event_time) return [];
+  const myMins = parseEventTimeMinutes(myEv.event_time);
+  if (myMins === null) return [];
+  return thisWeekEventsCache.filter(e =>
+    e.on_watchlist && e.your_name &&
+    e.your_name !== brief.event_name &&
+    e.event_date === myEv.event_date &&
+    Math.abs((parseEventTimeMinutes(e.event_time) ?? Infinity) - myMins) <= 30
+  );
+}
+
+function resolveCombinedSignal(verdicts) {
+  const directional = verdicts.filter(v => v.action !== 'SKIP');
+  const eName = n => (n||'').replace(/ US$| UK$/, '');
+  if (!directional.length) return {
+    action: 'SKIP', dir: null, color: 'var(--amber)', header: 'NO SIGNAL',
+    reasoning: 'All events matched forecast. No clear directional signal. Skip this release.',
+    tags: verdicts.map(v => `${eName(v.eventName)}: SKIP (matched)`)
+  };
+  const buys = directional.filter(v => v.action === 'BUY');
+  const sells = directional.filter(v => v.action === 'SELL');
+  if (!sells.length) {
+    const avgConf = Math.round(buys.reduce((s,v) => s+(v.confidence||0),0)/buys.length);
+    const avgPip = buys.reduce((s,v) => s+(v.avgPip5m||0),0)/buys.length;
+    return { action:'BUY', dir:'up', color:'var(--green)', header:'ALL AGREE — BUY', combinedConf:avgConf, avgPip,
+      reasoning:`All ${buys.length} events point the same direction. Strong combined signal.`,
+      tags: verdicts.map(v=>`${eName(v.eventName)}: ${v.action}${v.confidence!=null?' ('+Math.round(v.confidence)+'%)':''}`) };
+  }
+  if (!buys.length) {
+    const avgConf = Math.round(sells.reduce((s,v) => s+(v.confidence||0),0)/sells.length);
+    const avgPip = sells.reduce((s,v) => s+(v.avgPip5m||0),0)/sells.length;
+    return { action:'SELL', dir:'down', color:'var(--red)', header:'ALL AGREE — SELL', combinedConf:avgConf, avgPip,
+      reasoning:`All ${sells.length} events point the same direction. Strong combined signal.`,
+      tags: verdicts.map(v=>`${eName(v.eventName)}: ${v.action}${v.confidence!=null?' ('+Math.round(v.confidence)+'%)':''}`) };
+  }
+  // Mixed — tiebreak
+  const topBuy = buys.reduce((a,b)=>(b.confidence||0)>(a.confidence||0)?b:a);
+  const topSell = sells.reduce((a,b)=>(b.confidence||0)>(a.confidence||0)?b:a);
+  const allTags = verdicts.map(v=>`${eName(v.eventName)}: ${v.action}${v.confidence!=null?' ('+Math.round(v.confidence)+'%)':''}`);
+  // Tiebreak 1 — confidence gap >= 15
+  if (Math.abs((topBuy.confidence||0) - (topSell.confidence||0)) >= 15) {
+    const w = (topBuy.confidence||0)>(topSell.confidence||0)?topBuy:topSell;
+    const l = w===topBuy?topSell:topBuy;
+    return { action:w.action, dir:w.dir, color:w.action==='BUY'?'var(--green)':'var(--red)',
+      header:`CONFLICT RESOLVED — ${w.action}`, combinedConf:Math.round(w.confidence||0), avgPip:w.avgPip5m||0,
+      reasoning:`Conflicting signals. ${eName(w.eventName)} says ${w.action} at ${Math.round(w.confidence||0)}% confidence. ${eName(l.eventName)} says ${l.action} at ${Math.round(l.confidence||0)}% confidence. Following ${eName(w.eventName)} — significantly more reliable.`,
+      tags: allTags };
+  }
+  // Tiebreak 2 — surprise magnitude >= 1.5x
+  const bs = topBuy.surprisePct||0, ss = topSell.surprisePct||0;
+  if (Math.max(bs,ss)>0 && Math.max(bs,ss)/Math.max(Math.min(bs,ss),0.01)>=1.5) {
+    const w = bs>ss?topBuy:topSell, l = w===topBuy?topSell:topBuy;
+    return { action:w.action, dir:w.dir, color:w.action==='BUY'?'var(--green)':'var(--red)',
+      header:`CONFLICT RESOLVED — ${w.action}`, combinedConf:Math.round(w.confidence||0), avgPip:w.avgPip5m||0,
+      reasoning:`Conflicting signals with similar confidence. ${eName(w.eventName)} surprised by ${(w.surprisePct||0).toFixed(1)}% vs forecast. ${eName(l.eventName)} surprised by ${(l.surprisePct||0).toFixed(1)}% vs forecast. Following ${eName(w.eventName)} — bigger market surprise.`,
+      tags: allTags };
+  }
+  // Tiebreak 3 — occurrences
+  if ((topBuy.occurrences||0) !== (topSell.occurrences||0)) {
+    const w = (topBuy.occurrences||0)>(topSell.occurrences||0)?topBuy:topSell;
+    const l = w===topBuy?topSell:topBuy;
+    return { action:w.action, dir:w.dir, color:w.action==='BUY'?'var(--green)':'var(--red)',
+      header:`CONFLICT RESOLVED — ${w.action}`, combinedConf:Math.round(w.confidence||0), avgPip:w.avgPip5m||0,
+      reasoning:`Very similar conflicting signals. Following ${eName(w.eventName)} — more historical data (${w.occurrences||0} vs ${l.occurrences||0} occurrences).`,
+      tags: allTags };
+  }
+  // Genuine conflict
+  const detail = [topBuy, topSell].map(v =>
+    `${eName(v.eventName)} says ${v.action} at ${Math.round(v.confidence||0)}% confidence (${v.occurrences||0} occurrences, ${(v.surprisePct||0).toFixed(1)}% surprise)`
+  ).join('<br>');
+  return { action:'NO TRADE', dir:null, color:'var(--amber)', header:'GENUINE CONFLICT', combinedConf:null, avgPip:0,
+    reasoning:`${detail}<br><br>These signals are too evenly matched to call a direction. Skipping this release is the correct decision. There will be another trade.`,
+    tags: allTags };
+}
+
+function initLiveAssistant(brief, extraBriefs, groupData) {
+  const sameTime = (extraBriefs && extraBriefs.length)
+    ? extraBriefs.map(b => ({ your_name: b.event_name, _brief: b }))
+    : getSameTimeEvents(brief);
+  liveAssistantState = { brief, stage: 'before', sameTimeEvents: sameTime, groupData: groupData || null };
   renderLiveBefore();
+}
+
+async function checkDailyLimitBlocked() {
+  try {
+    const status = await GET('/daily-status');
+    return status.daily_limit_hit || status.trade_limit_hit ? status : null;
+  } catch(e) { return null; }
 }
 
 function renderLiveBefore() {
   const el = document.getElementById('live-assistant-panel');
   if (!el) return;
-  el.innerHTML = `
-    <div style="font-size:12px;color:var(--text2);margin-bottom:12px">News hasn't released yet? Come back when you have the actual number.</div>
+  const la = liveAssistantState;
+  const b = la.brief;
+  const same = la.sameTimeEvents || [];
+  const isMulti = same.length > 0;
+  let sameHtml = '';
+  if (isMulti) {
+    const safeId = n => 'live-actual-' + n.replace(/\W+/g,'_');
+    sameHtml = `<div style="background:var(--amber-dim);border:1px solid var(--amber);border-radius:8px;padding:12px;margin-bottom:14px;font-size:12px;color:var(--amber)">
+      <strong>Other events releasing at the same time:</strong><br>
+      ${same.map(e=>`<span class="badge caution" style="margin:2px">${(e.your_name||'').replace(/ US$| UK$/,'')}</span>`).join(' ')}
+      <div style="margin-top:6px;font-size:11px;color:var(--text2)">Enter actuals for ALL of them to get a combined signal.</div>
+    </div>
+    <div style="margin-bottom:10px">
+      <label style="font-size:11px;font-weight:600;color:var(--text2);text-transform:uppercase;letter-spacing:0.8px">${b.event_name.replace(/ US$| UK$/,'')} — Actual</label>
+      <input type="text" id="live-actual-main" placeholder="e.g. 54.2" style="width:100%;margin-top:6px">
+    </div>
+    ${same.map(e=>`<div style="margin-bottom:10px">
+      <label style="font-size:11px;font-weight:600;color:var(--text2);text-transform:uppercase;letter-spacing:0.8px">${(e.your_name||'').replace(/ US$| UK$/,'')} — Actual</label>
+      <input type="text" id="${safeId(e.your_name)}" placeholder="e.g. 47.4" style="width:100%;margin-top:6px">
+    </div>`).join('')}`;
+  } else {
+    sameHtml = `<div style="font-size:12px;color:var(--text2);margin-bottom:12px">News hasn't released yet? Come back when you have the actual number.</div>
     <label style="font-size:11px;font-weight:600;color:var(--text2);text-transform:uppercase;letter-spacing:0.8px">Actual Number (enter when news releases)</label>
     <div style="display:flex;gap:10px;margin-top:8px;align-items:center">
       <input type="text" id="live-actual-input" placeholder="e.g. 54.2, 172K, 3.8%" style="flex:1">
-      <button class="btn btn-primary" id="live-start-btn">Start Live Mode</button>
+    </div>`;
+  }
+  el.innerHTML = `${sameHtml}
+    <div style="margin-top:12px">
+      <button class="btn btn-primary" id="live-start-btn">${isMulti ? 'Get Combined Signal' : 'Start Live Mode'}</button>
     </div>
     <div id="live-before-error" style="font-size:11px;color:var(--red);margin-top:8px"></div>`;
   document.getElementById('live-start-btn').onclick = startLiveMode;
 }
 
 async function startLiveMode() {
+  // Section 2: check daily limits before allowing live mode to proceed
+  const limitStatus = await checkDailyLimitBlocked();
+  if (limitStatus) {
+    const panel = document.getElementById('live-assistant-panel');
+    const currency = limitStatus.account_currency || 'GBP';
+    const reason = limitStatus.daily_limit_hit
+      ? `Daily loss limit reached — you are down ${currency}${Math.abs(limitStatus.today_pnl||0).toFixed(2)} today (${limitStatus.daily_limit_pct}% of account).`
+      : `Trade limit reached — ${limitStatus.today_count} trades taken today (max ${limitStatus.max_trades}).`;
+    if (panel) panel.innerHTML = `<div style="background:var(--red-dim);border:1px solid var(--red);border-radius:10px;padding:20px">
+      <div style="font-weight:700;color:var(--red);margin-bottom:8px">🛑 ${limitStatus.daily_limit_hit ? 'DAILY LOSS LIMIT REACHED' : 'TRADE LIMIT REACHED'}</div>
+      <div style="font-size:13px;color:var(--text);margin-bottom:10px">${reason}</div>
+      <div style="font-size:12px;color:var(--text2)">This limit resets tomorrow. There will be another trade. Protect your capital.</div>
+    </div>`;
+    return;
+  }
   const errEl = document.getElementById('live-before-error');
-  const actual = document.getElementById('live-actual-input')?.value.trim();
-  if (!actual) {
-    if (errEl) errEl.textContent = 'Enter the actual number released.';
-    return;
+  const la = liveAssistantState;
+  const b = la.brief;
+  const same = la.sameTimeEvents || [];
+  const isMulti = same.length > 0;
+  const safeId = n => 'live-actual-' + n.replace(/\W+/g,'_');
+
+  // Collect actuals
+  const actuals = {};
+  if (isMulti) {
+    actuals[b.event_name] = document.getElementById('live-actual-main')?.value.trim() || '';
+    same.forEach(ev => { actuals[ev.your_name] = document.getElementById(safeId(ev.your_name))?.value.trim() || ''; });
+    for (const [name, val] of Object.entries(actuals)) {
+      if (!val) { if (errEl) errEl.textContent = `Enter the actual for ${name.replace(/ US$| UK$/,'')}.`; return; }
+    }
+  } else {
+    actuals[b.event_name] = document.getElementById('live-actual-input')?.value.trim() || '';
+    if (!actuals[b.event_name]) { if (errEl) errEl.textContent = 'Enter the actual number released.'; return; }
   }
-  const b = liveAssistantState.brief;
-  const forecast = b.forecast;
-  if (parseBriefNumber(actual) === null || parseBriefNumber(forecast) === null) {
-    if (errEl) errEl.textContent = 'Could not parse actual or forecast. Enter a plain number (e.g. 54.2).';
-    return;
-  }
+
+  // Fetch open price
   let openPrice;
   try {
     const p = await GET('/oanda/current-price');
     openPrice = p.price;
-  } catch(e) {
-    if (errEl) errEl.textContent = 'Could not fetch OANDA price — connect in Settings.';
+  } catch(e) { if (errEl) errEl.textContent = 'Could not fetch OANDA price — connect in Settings.'; return; }
+
+  if (!isMulti) {
+    // Single-event path (unchanged)
+    const actual = actuals[b.event_name];
+    if (parseBriefNumber(actual) === null || parseBriefNumber(b.forecast) === null) {
+      if (errEl) errEl.textContent = 'Could not parse actual or forecast. Enter a plain number (e.g. 54.2).'; return;
+    }
+    const { scenario, percentDiff } = calcBeatMissLive(actual, b.forecast, b.abs_threshold || 1.0, b.value_type || 'percent');
+    const rec = getLiveRecommendation(b, scenario);
+    liveAssistantState = { brief:b, stage:'A', actual, openPrice, currentPrice:openPrice, scenario, percentDiff, rec, countdownSecs:300, entryPrice:null, priceTimer:null, countdownTimer:null };
+    renderLiveStageA();
+    if (rec.action !== 'SKIP') startLiveCountdown(); else renderLiveSkipWait();
     return;
   }
-  const { scenario, percentDiff } = calcBeatMissLive(actual, forecast);
-  const rec = getLiveRecommendation(b, scenario);
-  liveAssistantState = {
-    brief: b, stage: 'A', actual, openPrice, currentPrice: openPrice,
-    scenario, percentDiff, rec, countdownSecs: 300, entryPrice: null,
-    priceTimer: null, countdownTimer: null,
-  };
-  renderLiveStageA();
-  if (rec.action !== 'SKIP') startLiveCountdown();
-  else renderLiveSkipWait();
+
+  // Multi-event path
+  const panel = document.getElementById('live-assistant-panel');
+  if (panel) panel.innerHTML = '<div style="font-size:12px;color:var(--text2);padding:8px 0">Fetching data for all events...</div>';
+  try {
+    const extraBriefs = same.map(e => e._brief || null);
+    const fetched = await Promise.all(same.map((ev, i) =>
+      extraBriefs[i] ? Promise.resolve(extraBriefs[i]) : GET('/brief/' + encodeURIComponent(ev.your_name)).catch(() => null)
+    ));
+    const allBriefs = [b, ...fetched.filter(Boolean)];
+
+    const verdicts = allBriefs.map(br => {
+      const actual = actuals[br.event_name] || '';
+      if (!actual || parseBriefNumber(actual) === null || parseBriefNumber(br.forecast) === null) {
+        return { eventName:br.event_name, action:'SKIP', dir:null, confidence:null, occurrences:0, surprisePct:0, avgPip5m:br.avg_pip_5m||0, brief:br, scenarioKey:'inline' };
+      }
+      const { scenario, percentDiff } = calcBeatMissLive(actual, br.forecast, br.abs_threshold || 1.0, br.value_type || 'percent');
+      const rec = getLiveRecommendation(br, scenario);
+      const confidence = scenario==='beat' ? br.beat_consistency : scenario==='miss' ? br.miss_consistency : null;
+      const occurrences = scenario==='beat' ? (br.beat_count||0) : scenario==='miss' ? (br.miss_count||0) : 0;
+      return { eventName:br.event_name, action:rec.action, dir:rec.dir, confidence, occurrences, surprisePct:percentDiff, avgPip5m:br.avg_pip_5m||0, brief:br, scenarioKey: scenario === 'match' ? 'inline' : scenario };
+    });
+
+    // Resolve combined verdict — prefer co-occurrence data if available
+    const groupData = la.groupData;
+    let combined;
+    if (groupData && groupData.has_sufficient_data) {
+      // Build scenario key in sorted-name order (matches group_key order)
+      const sortedV = [...verdicts].sort((a, b) => a.eventName.localeCompare(b.eventName));
+      const scenarioKey = sortedV.map(v => v.scenarioKey).join('|');
+      const scRow = (groupData.scenarios || []).find(s => s.scenario === scenarioKey);
+      if (scRow && scRow.count >= 3) {
+        const dir = scRow.direction;
+        combined = {
+          action: dir === 'up' ? 'BUY' : 'SELL', dir,
+          color: dir === 'up' ? 'var(--green)' : 'var(--red)',
+          header: `HISTORICAL PATTERN — ${dir === 'up' ? 'BUY' : 'SELL'}`,
+          combinedConf: scRow.consistency, avgPip: scRow.avg_pip_5m || 0,
+          reasoning: `This exact combination has happened ${scRow.count} time${scRow.count !== 1 ? 's' : ''} before. GBP/USD went ${dir.toUpperCase()} ${scRow.consistency}% of those times, averaging ${(scRow.avg_pip_5m || 0).toFixed(1)}p in the first 5 minutes.`,
+          tags: sortedV.map(v => `${v.eventName.replace(/ US$| UK$/,'')}: ${v.scenarioKey.toUpperCase()}`),
+        };
+      } else if (scRow) {
+        const dir = scRow.direction;
+        combined = {
+          action: dir === 'up' ? 'BUY' : 'SELL', dir,
+          color: 'var(--amber)', header: 'CAUTION — SMALL SAMPLE',
+          combinedConf: scRow.consistency, avgPip: scRow.avg_pip_5m || 0,
+          reasoning: `This combination has only happened ${scRow.count} time${scRow.count !== 1 ? 's' : ''} before. Not enough history to be confident. Consider skipping or using smaller position size.`,
+          tags: sortedV.map(v => `${v.eventName.replace(/ US$| UK$/,'')}: ${v.scenarioKey.toUpperCase()}`),
+        };
+      } else {
+        combined = resolveCombinedSignal(verdicts);
+        combined.reasoning = (combined.reasoning || '') + ' This exact combination has not occurred in the recorded history. Falling back to individual event statistics.';
+      }
+    } else {
+      combined = resolveCombinedSignal(verdicts);
+    }
+
+    liveAssistantState = {
+      brief:b, stage:'A', actual:actuals[b.event_name], openPrice, currentPrice:openPrice,
+      scenario: combined.action==='BUY'||combined.action==='SELL' ? 'beat' : 'match',
+      percentDiff: verdicts[0]?.surprisePct||0,
+      rec: { action: combined.action==='NO TRADE'?'SKIP':combined.action, dir:combined.dir, header:combined.header, color:combined.color },
+      countdownSecs:300, entryPrice:null, priceTimer:null, countdownTimer:null,
+      multiMode:true, verdicts, combined, groupData,
+    };
+    renderLiveCombinedStageA();
+    if (combined.action!=='SKIP' && combined.action!=='NO TRADE') startLiveCountdown(); else renderLiveSkipWait();
+  } catch(e) {
+    if (errEl) errEl.textContent = `Error: ${e.message}`;
+  }
 }
 
 function renderLiveStageA() {
@@ -1003,10 +1631,38 @@ function renderLiveStageA() {
       ${dirHtml}
       <div style="font-size:12px;color:var(--text2);margin-top:8px">
         Confidence: <span class="mono">${conf != null ? conf + '%' : '—'}</span> reliable based on <span class="mono">${count || 0}</span> past occurrences<br>
-        Surprise size: <span class="mono">${la.percentDiff.toFixed(1)}%</span> off forecast<br>
+        Surprise size: <span class="mono">${la.percentDiff != null ? la.percentDiff.toFixed(1) + '%' : Math.abs((parseBriefNumber(la.actual)||0)-(parseBriefNumber(la.brief.forecast)||0)).toFixed(2) + ' (abs)'}</span> off forecast<br>
         ${moveExpect}
       </div>
     </div>
+    <div id="live-stage-b-container"></div>`;
+}
+
+function renderLiveCombinedStageA() {
+  const la = liveAssistantState;
+  const el = document.getElementById('live-assistant-panel');
+  if (!el || !la) return;
+  const { combined, verdicts } = la;
+  const action = combined.action;
+  const boxClass = action==='BUY' ? 'live-stage-go' : action==='SELL' ? 'live-stage-no' : 'live-stage-warn';
+  const dirHtml = action==='BUY'
+    ? '<div class="live-verdict-buy">▲ BUY GBP/USD</div>'
+    : action==='SELL'
+      ? '<div class="live-verdict-sell">▼ SELL GBP/USD</div>'
+      : `<div class="live-verdict-skip">⚠ ${action === 'NO TRADE' ? 'NO TRADE' : 'SKIP'}</div>`;
+  const confLine = combined.combinedConf != null
+    ? `Combined confidence: <span class="mono">${combined.combinedConf}%</span>&nbsp;&nbsp;·&nbsp;&nbsp;` : '';
+  const avgPipLine = combined.avgPip
+    ? `Expected move: ~<span class="mono">${(combined.avgPip||0).toFixed(1)}p</span>` : '';
+  const tagsHtml = combined.tags ? `<div class="live-combined-tags">${combined.tags.join(' · ')}</div>` : '';
+  el.innerHTML = `
+    <div style="font-size:11px;font-weight:700;letter-spacing:1px;color:${combined.color};margin-bottom:8px">${combined.header}</div>
+    <div class="live-combined-verdict ${boxClass}">
+      ${dirHtml}
+      <div style="font-size:12px;color:var(--text2);margin-top:8px">${confLine}${avgPipLine}</div>
+      ${tagsHtml}
+    </div>
+    <div class="live-combined-reasoning">${combined.reasoning}</div>
     <div id="live-stage-b-container"></div>`;
 }
 
@@ -1042,6 +1698,7 @@ async function pollLivePrice() {
   try {
     const p = await GET('/oanda/current-price');
     liveAssistantState.currentPrice = p.price;
+    _calcRate = p.price; // keep rate up-to-date for P&L calc
     updateLivePriceDisplay();
     if (liveAssistantState.stage === 'D') updateLiveTracking();
     if (liveAssistantState.stage === 'B') updateLiveWaitStatus();
@@ -1098,8 +1755,10 @@ function renderLiveStageB() {
 
 function cancelLiveMode() {
   const b = liveAssistantState?.brief;
+  const gd = liveAssistantState?.groupData;
+  const extra = liveAssistantState?.sameTimeEvents?.filter(e => e._brief).map(e => e._brief) || [];
   stopLiveAssistant();
-  if (b) initLiveAssistant(b);
+  if (b) initLiveAssistant(b, extra.length ? extra : undefined, gd);
 }
 
 function renderLiveStageC() {
@@ -1139,12 +1798,25 @@ function renderLiveStageC() {
       Action: <strong>${la.rec.action} GBP/USD</strong><br>
       Entry price: <span class="mono">${entry.toFixed(5)}</span><br>
       Stop Loss: <span class="mono">${slPrice.toFixed(5)}</span> (<span class="mono">${sl}p</span>)<br>
-      Take Profit: <span class="mono">${tpPrice.toFixed(5)}</span> (<span class="mono">${tpPips}p</span>)<br><br>
-      Risk reminder: Only risk 1–2% of your account on this trade.
+      Take Profit: <span class="mono">${tpPrice.toFixed(5)}</span> (<span class="mono">${tpPips}p</span>)
+      <div style="margin-top:16px;border-top:1px solid var(--green);padding-top:14px">
+        <strong style="font-size:11px;letter-spacing:1px;color:var(--text2)">MONEY CAPTURE (required)</strong>
+        <div class="form-grid-3" style="margin-top:10px">
+          <div class="form-group"><label>Entry Price</label>
+            <input type="number" id="live-entry-price" step="0.00001" value="${entry.toFixed(5)}" placeholder="1.26540"></div>
+          <div class="form-group"><label>Lot Size</label>
+            <input type="number" id="live-lot-size" step="0.01" placeholder="0.10" id="live-lot-size"></div>
+          <div class="form-group"><label>Spread at Entry (pips)</label>
+            <input type="number" id="live-spread" step="0.1" placeholder="Optional"></div>
+        </div>
+        <div id="live-calc-hint" style="font-size:11px;color:var(--text2);margin-top:6px">Use the position calculator on the Live Trades page to size your position.</div>
+      </div>
       <div style="margin-top:14px;display:flex;gap:10px">
-        <button class="btn btn-primary" onclick="confirmLiveEntry()">I've Entered the Trade</button>
+        <button class="btn btn-primary" id="live-confirm-btn" onclick="confirmLiveEntry()">I've Entered the Trade</button>
         <button class="btn btn-secondary" onclick="cancelLiveMode()">Cancel</button>
-      </div></div>`;
+      </div>
+      <div id="live-confirm-err" style="font-size:11px;color:var(--red);margin-top:6px"></div>
+    </div>`;
     la.plannedSl = slPrice;
     la.plannedTp = tpPrice;
   } else {
@@ -1158,9 +1830,22 @@ function renderLiveStageC() {
 
 function confirmLiveEntry() {
   const la = liveAssistantState;
+  const errEl = document.getElementById('live-confirm-err');
+  // Validate required money fields
+  const entryPriceEl = document.getElementById('live-entry-price');
+  const lotSizeEl = document.getElementById('live-lot-size');
+  if (entryPriceEl && lotSizeEl) {
+    const ep = parseFloat(entryPriceEl.value);
+    const ls = parseFloat(lotSizeEl.value);
+    if (!ep || ep <= 0) { if (errEl) errEl.textContent = 'Enter your actual entry price.'; return; }
+    if (!ls || ls <= 0) { if (errEl) errEl.textContent = 'Enter your lot size from the position calculator.'; return; }
+    la.capturedEntryPrice = ep;
+    la.capturedLotSize = ls;
+    la.capturedSpread = parseFloat(document.getElementById('live-spread')?.value) || null;
+  }
   la.stage = 'D';
-  la.entryPrice = la.currentPrice;
-  const sl = la.brief.suggested_sl || 10;
+  la.entryPrice = la.capturedEntryPrice || la.currentPrice;
+  const sl = la.brief.suggested_sl || 15;
   const rr = la.brief.suggested_rr || 5;
   const tpPips = sl * rr;
   const pipSize = 0.0001;
@@ -1200,16 +1885,23 @@ function updateLiveTracking() {
   const cur = la.currentPrice;
   const isBuy = la.rec.action === 'BUY';
   const pnlPips = isBuy ? livePips(entry, cur) : livePips(cur, entry);
+  const lotSize = la.capturedLotSize || 0;
+  const pipValueGbp = _calcRate ? (10 / _calcRate) : 0;
+  const pnlGbp = pnlPips * lotSize * pipValueGbp;
   const body = document.getElementById('live-tracking-body');
   const status = document.getElementById('live-tracking-status');
   const marker = document.getElementById('live-progress-marker');
   if (body) {
+    const pnlColor = pnlGbp >= 0 ? 'var(--green)' : 'var(--red)';
+    const pnlSign = pnlGbp >= 0 ? '+' : '';
     body.innerHTML = `
       Entry price: <span class="mono">${entry.toFixed(5)}</span> (locked)<br>
       Current price: <span class="mono">${cur.toFixed(5)}</span><br>
-      Pips in profit/loss: <span class="mono" style="color:${pnlPips>=0?'var(--green)':'var(--red)'}">${pnlPips>=0?'+':''}${pnlPips}p</span><br>
-      Stop Loss: <span class="mono">${la.plannedSl.toFixed(5)}</span><br>
-      Take Profit: <span class="mono">${la.plannedTp.toFixed(5)}</span>`;
+      Pips: <span class="mono" style="color:${pnlColor}">${pnlPips>=0?'+':''}${pnlPips}p</span>
+      ${lotSize ? `&nbsp;·&nbsp; <span class="mono" style="font-size:18px;color:${pnlColor}">${pnlSign}£${Math.abs(pnlGbp).toFixed(2)}</span> unrealised` : ''}<br>
+      Stop Loss: <span class="mono">${la.plannedSl?.toFixed(5)||'—'}</span><br>
+      Take Profit: <span class="mono">${la.plannedTp?.toFixed(5)||'—'}</span>
+      ${lotSize ? `<br>Lot size: <span class="mono">${lotSize.toFixed(2)}</span>` : ''}`;
   }
   if (marker && la.plannedSl && la.plannedTp) {
     const range = la.plannedTp - la.plannedSl;
@@ -1230,21 +1922,68 @@ function updateLiveTracking() {
   }
 }
 
-function logLiveTrade(outcome) {
+async function logLiveTrade(outcome) {
   const la = liveAssistantState;
   if (!la) return;
-  pendingLogNews = la.brief.event_name;
-  pendingLogPrefill = {
-    outcome,
-    entry: '5 min after checking reaction',
-    ratio: la.brief.suggested_rr,
-    sl: la.brief.suggested_sl,
-    actual: la.actual,
-    forecast: la.brief.forecast,
-    trade_type: 'live',
-  };
+  // Prompt for actual exit price
+  const exitPriceStr = prompt(`Enter your actual exit price (5 decimal places):`, la.currentPrice?.toFixed(5) || '');
+  const exitPrice = parseFloat(exitPriceStr) || null;
+  const entry = la.capturedEntryPrice || la.entryPrice;
+  const lotSize = la.capturedLotSize || null;
+  const isBuy = la.rec.action === 'BUY';
+
+  // Compute P&L in GBP
+  let pnl = null;
+  if (exitPrice && entry && lotSize && _calcRate) {
+    const pipValueGbp = 10 / _calcRate;
+    const pips = isBuy ? (exitPrice - entry) * 10000 : (entry - exitPrice) * 10000;
+    pnl = parseFloat((pips * lotSize * pipValueGbp).toFixed(2));
+  }
+
+  // Fetch settings for account balance context
+  let cfg = {};
+  try { cfg = await GET('/settings'); } catch(e) {}
+  const startingBalance = parseFloat(cfg.starting_balance || '5000');
+
+  // Get existing live PnL total to compute current balance
+  let currentBalance = startingBalance;
+  try {
+    const existingTrades = await GET('/trades?trade_type=live');
+    const existingPnl = existingTrades.reduce((s,t) => s + (t.pnl||0), 0);
+    currentBalance = startingBalance + existingPnl;
+  } catch(e) {}
+
+  const today = new Date().toISOString().split('T')[0];
+  try {
+    await POST('/trades', {
+      date: today,
+      news1: la.brief.event_name,
+      news2: la.brief.same_day_events?.[0] || '',
+      news3: la.brief.same_day_events?.[1] || '',
+      entry: '5 min after checking reaction',
+      ratio: la.brief.suggested_rr,
+      sl: la.brief.suggested_sl,
+      actual: la.actual,
+      forecast: la.brief.forecast,
+      outcome,
+      improvement: '',
+      trade_type: 'live',
+      direction: la.rec.action,
+      entry_price: entry,
+      exit_price: exitPrice,
+      lot_size: lotSize,
+      spread_at_entry: la.capturedSpread,
+      pnl,
+      account_balance: currentBalance,
+      risk_percent: parseFloat(cfg.default_risk_pct || '2'),
+    });
+    toast(`Trade logged — ${outcome}${pnl != null ? ` — £${pnl.toFixed(2)}` : ''}`, outcome === 'Win' ? 'success' : 'error');
+  } catch(e) {
+    toast('Failed to save trade: ' + e.message, 'error');
+  }
+
   closeBriefModal();
-  nav('log');
+  nav('livetrades');
 }
 
 // ── ANALYSIS ──────────────────────────────────────────────
@@ -1252,6 +1991,13 @@ async function renderAnalysis() {
   const [data, syncStatus, journalData] = await Promise.all([
     GET('/analysis'), GET('/sync/status'), GET('/journal')
   ]);
+  // Build shared-reading lookup: eventName → [otherMemberNames]
+  const sharedReadingMap = {};
+  Object.values(data.shared_reading || {}).forEach(grp => {
+    grp.members.forEach(name => {
+      sharedReadingMap[name] = grp.members.filter(m => m !== name);
+    });
+  });
   journalDataCache = journalData.events || [];
   const m = document.getElementById('main');
   const isSyncing = syncStatus.running;
@@ -1287,28 +2033,56 @@ async function renderAnalysis() {
     return;
   }
 
-  const rows = summary.map(ev => `<tr class="event-detail-row" onclick='showEventDetail(${JSON.stringify(ev.your_name)})'>
-    <td><div style="font-size:12px;font-weight:600">${ev.your_name.replace(/ US$| UK$/,'')}</div><div style="margin-top:3px">${countryBadge(ev.country)}</div></td>
+  const rows = summary.map(ev => {
+    const srOthers = sharedReadingMap[ev.your_name];
+    const srTag = srOthers && srOthers.length
+      ? `<span class="shared-reading-tag" title="This event usually releases at the same time as ${srOthers.map(n=>n.replace(/ US$| UK$/,'')).join(' + ')}. Its pip figures reflect the combined reaction to all of them. Use the Combined Brief for a more accurate read.">SHARED READING</span>`
+      : '';
+    const solo = ev.solo_count != null ? ev.solo_count : ev.total_occurrences;
+    const co = ev.co_released_count || 0;
+    const countCell = co > 0
+      ? `<span class="mono">${ev.total_occurrences}</span><br><span style="font-size:10px;color:var(--text3)">${solo} solo · ${co} paired</span>`
+      : `<span class="mono">${ev.total_occurrences}</span>`;
+    const fewSolo = solo < 5;
+    const dirCell = fewSolo
+      ? `<span class="direction-na" title="Fewer than 5 solo occurrences — use Combined Brief for reliable direction">—</span>`
+      : null;
+    const beatCell = dirCell || (ev.beat_direction
+      ? `${dirIcon(ev.beat_direction)} <span style="font-size:11px;color:var(--text2)">${ev.beat_consistency}%</span>`
+      : '—');
+    const missCell = dirCell || (ev.miss_direction
+      ? `${dirIcon(ev.miss_direction)} <span style="font-size:11px;color:var(--text2)">${ev.miss_consistency}%</span>`
+      : '—');
+    return `<tr class="event-detail-row" onclick='showEventDetail(${JSON.stringify(ev.your_name)})'>
+    <td><div style="font-size:12px;font-weight:600">${ev.your_name.replace(/ US$| UK$/,'')}${srTag}${fewSolo&&co>0?`<span class="shared-reading-tag" title="This event nearly always releases alongside ${srOthers?srOthers.map(n=>n.replace(/ US$| UK$/,'')).join(' + '):'another event'}. Use the Combined Brief for reliable direction data.">FEW SOLO</span>`:''}
+    </div><div style="margin-top:3px">${countryBadge(ev.country)}</div></td>
     <td><span class="badge ${ev.impact==='red'?'loss':'caution'}">${(ev.impact||'—').toUpperCase()}</span></td>
-    <td class="mono" style="font-size:12px">${ev.total_occurrences}</td>
-    <td><span class="pip-pill ${pipClass(ev.avg_pip_5m)}">${pipLabel(ev.avg_pip_5m)}</span></td>
-    <td><span class="pip-pill ${pipClass(ev.avg_pip_15m)}">${pipLabel(ev.avg_pip_15m)}</span></td>
-    <td><span class="pip-pill ${pipClass(ev.avg_pip_30m)}">${pipLabel(ev.avg_pip_30m)}</span></td>
-    <td>${ev.beat_direction ? `${dirIcon(ev.beat_direction)} <span style="font-size:11px;color:var(--text2)">${ev.beat_consistency}%</span>` : '—'}</td>
-    <td>${ev.miss_direction ? `${dirIcon(ev.miss_direction)} <span style="font-size:11px;color:var(--text2)">${ev.miss_consistency}%</span>` : '—'}</td>
+    <td style="font-size:12px">${countCell}</td>
+    <td><span class="pip-pill none" style="color:var(--text3);font-size:10px" title="Pre-entry move (not capturable after 5-min wait)">${pipLabel(ev.avg_pip_5m)}</span></td>
+    <td><span class="pip-pill ${pipClass(ev.avg_post_entry_5_30)}">${pipLabel(ev.avg_post_entry_5_30)}</span></td>
+    <td><span class="pip-pill ${pipClass(ev.avg_max_adverse)}" style="opacity:0.7">${pipLabel(ev.avg_max_adverse)}</span></td>
+    <td>${beatCell}</td>
+    <td>${missCell}</td>
     <td><span class="tradeable-badge ${ev.tradeable?'tradeable-yes':'tradeable-no'}">${ev.tradeable?'✓ YES':'✗ NO'}</span></td>
-    <td style="font-size:11px;color:var(--text2);max-width:180px">${whatThisMeans(ev)}</td>
-  </tr>`).join('');
+    <td style="font-size:11px;color:var(--text2);max-width:200px">${whatThisMeans(ev)}</td>
+  </tr>`;
+  }).join('');
 
-  m.innerHTML = `<div class="page-header"><div class="page-title">Analysis</div><div class="page-sub">Historical news performance · Jan 2020 to today · Click any row for full history</div></div>
+  m.innerHTML = `<div class="page-header"><div class="page-title">Analysis</div><div class="page-sub">Historical news performance · Jan 2015 to today · Click any row for full history</div></div>
     ${syncBar}${renderFilterBar('renderAnalysis')}
     <div class="three-col" style="margin-bottom:24px">
       <div class="stat-card"><div class="stat-label">Events (filtered)</div><div class="stat-value blue">${filtered.length}</div></div>
       <div class="stat-card"><div class="stat-label">Event Types</div><div class="stat-value blue">${summary.length}</div></div>
-      <div class="stat-card"><div class="stat-label">Tradeable</div><div class="stat-value green">${summary.filter(e=>e.tradeable).length}</div></div>
+      <div class="stat-card"><div class="stat-label">Tradeable (post-entry)</div><div class="stat-value green">${summary.filter(e=>e.tradeable).length}</div></div>
     </div>
-    <div class="card"><div class="card-title">News Event Performance · Sorted by 5M Pip Move</div>
-      <div class="table-wrap"><table><tr><th>Event</th><th>Impact</th><th>Count</th><th>Avg 5M</th><th>Avg 15M</th><th>Avg 30M</th><th>Beat → Dir</th><th>Miss → Dir</th><th>Tradeable</th><th>What This Means</th></tr>${rows}</table></div>
+    <div class="card"><div class="card-title">News Event Performance · Sorted by Post-Entry Move</div>
+      <div class="table-wrap"><table><tr>
+        <th>Event</th><th>Impact</th><th>Count</th>
+        <th title="Pre-entry 5M move — not capturable after a 5-min wait" style="color:var(--text3)">Pre-Entry 5M ⓘ</th>
+        <th>Post-Entry (5→30m)</th>
+        <th>Avg Heat</th>
+        <th>Beat → Dir</th><th>Miss → Dir</th><th>Tradeable</th><th>What This Means</th>
+      </tr>${rows}</table></div>
     </div><div id="event-detail" style="margin-top:20px"></div>`;
   if (isSyncing) syncPollTimer = setTimeout(() => renderAnalysis(), 3000);
 }
@@ -1325,10 +2099,10 @@ async function startSync() {
 }
 
 async function startFullSync() {
-  if (!confirm('Full resync from Jan 2020 will take 20-30 minutes. Continue?')) return;
+  if (!confirm('Full resync from Jan 2015 will take 2-3 hours. Run overnight. Continue?')) return;
   try {
     await POST('/sync/full', {});
-    toast('Full resync started — leave the app running', 'success');
+    toast('Full resync started — leave the app running overnight', 'success');
     nav('analysis');
   } catch(e) {
     toast('Failed: ' + e.message, 'error');
@@ -1734,11 +2508,722 @@ async function delRating(name) {
   await DEL('/ratings/'+encodeURIComponent(name)); toast('Deleted','success'); renderNewsCheck();
 }
 
+// ── BLUEPRINT ─────────────────────────────────────────────
+function renderBlueprint() {
+  const m = document.getElementById('main');
+  m.innerHTML = `
+<style>
+.bp{max-width:900px;margin:0 auto;padding:24px 32px 80px;font-size:14px;line-height:1.7;color:var(--text)}
+.bp h1{font-size:22px;font-weight:700;color:var(--accent);margin:36px 0 6px;border-bottom:1px solid var(--border);padding-bottom:8px}
+.bp h2{font-size:16px;font-weight:700;color:var(--text);margin:28px 0 8px}
+.bp h3{font-size:13px;font-weight:700;color:var(--accent);margin:20px 0 6px;text-transform:uppercase;letter-spacing:.6px}
+.bp p{margin:8px 0}
+.bp ul,.bp ol{margin:8px 0 8px 24px}
+.bp li{margin:3px 0}
+.bp strong{color:var(--text)}
+.bp em{color:var(--text2);font-style:italic}
+.bp code,.bp .mono{font-family:'JetBrains Mono',monospace;font-size:12px;background:var(--surface);padding:1px 5px;border-radius:3px;color:var(--accent)}
+.bp pre{background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:14px 16px;overflow-x:auto;margin:12px 0;font-family:'JetBrains Mono',monospace;font-size:12px;line-height:1.6}
+.bp table{width:100%;border-collapse:collapse;margin:12px 0;font-size:13px}
+.bp th{text-align:left;padding:7px 10px;background:var(--surface);color:var(--text2);font-weight:600;border-bottom:1px solid var(--border);font-size:11px;text-transform:uppercase;letter-spacing:.5px}
+.bp td{padding:7px 10px;border-bottom:1px solid var(--border)}
+.bp tr:last-child td{border-bottom:none}
+.bp tr:hover td{background:var(--accent-dim)}
+.bp .toc{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:16px 20px;margin-bottom:32px}
+.bp .toc h3{margin-top:0}
+.bp .toc a{color:var(--text2);text-decoration:none;display:block;padding:2px 0;font-size:13px}
+.bp .toc a:hover{color:var(--accent)}
+.bp .warn{background:#2a1a0a;border-left:3px solid var(--amber);padding:10px 14px;border-radius:0 6px 6px 0;margin:12px 0;font-size:13px}
+.bp .info{background:var(--accent-dim);border-left:3px solid var(--accent);padding:10px 14px;border-radius:0 6px 6px 0;margin:12px 0;font-size:13px}
+.bp .badge-good{color:#4caf50;font-weight:700;font-size:11px}
+.bp .badge-caution{color:var(--amber);font-weight:700;font-size:11px}
+.bp .badge-bad{color:var(--red);font-weight:700;font-size:11px}
+.bp .badge-vbad{color:#ff1744;font-weight:700;font-size:11px}
+.bp .badge-unrel{color:var(--text2);font-weight:700;font-size:11px}
+.bp .flow{background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:16px;margin:12px 0;font-family:'JetBrains Mono',monospace;font-size:12px;line-height:2;white-space:pre}
+.bp .section-meta{font-size:11px;color:var(--text2);margin-bottom:24px}
+</style>
+<div class="bp">
+
+<div style="margin-bottom:8px">
+  <span style="font-size:11px;color:var(--text2);font-family:'JetBrains Mono',monospace">GBP/USD TRADING INTELLIGENCE PLATFORM</span>
+</div>
+<div style="font-size:26px;font-weight:700;color:var(--text);margin-bottom:4px">System Blueprint &amp; Operating Manual</div>
+<div class="section-meta">
+  Owner: Yafet Wolde &nbsp;·&nbsp; Instrument: GBP/USD &nbsp;·&nbsp; Timeframe: 5-minute &nbsp;·&nbsp;
+  Live capital from: July 2026 &nbsp;·&nbsp; Last updated: 21 July 2026
+</div>
+
+<div class="info">
+  <strong>If you are the owner</strong> — sections 2, 7, 8 and 11 are the ones you will return to. Everything else is reference.<br>
+  <strong>If you are here to help</strong> — read sections 1 → 2 → 3 → 9 → 10 in that order. Do not touch code until you have read section 10.
+</div>
+
+<div class="toc">
+  <h3>Contents</h3>
+  <a href="#s1">1. What this is and why it exists</a>
+  <a href="#s2">2. The trading strategy in plain terms</a>
+  <a href="#s3">3. System architecture</a>
+  <a href="#s4">4. The data pipeline</a>
+  <a href="#s5">5. Database</a>
+  <a href="#s6">6. The application, page by page</a>
+  <a href="#s7">7. The trading workflow</a>
+  <a href="#s8">8. Risk management</a>
+  <a href="#s9">9. Design decisions and reasoning</a>
+  <a href="#s10">10. Bugs found and fixed</a>
+  <a href="#s11">11. Health checks</a>
+  <a href="#s12">12. Running and maintaining</a>
+  <a href="#s13">13. Known limitations</a>
+  <a href="#s14">14. Roadmap</a>
+  <a href="#s15">15. Onboarding a new contributor</a>
+  <a href="#s16">16. Glossary</a>
+</div>
+
+<!-- ── SECTION 1 ── -->
+<h1 id="s1">1. What this is and why it exists</h1>
+
+<h2>1.1 The problem it solves</h2>
+<p>Trading around scheduled economic news is a well-known retail strategy. The usual failure is that traders rely on memory and instinct: they <em>think</em> Non Farm Payroll moves the market a lot, they <em>think</em> PPI is unreliable, they <em>feel</em> they should have entered earlier. None of it is measured, so nothing improves.</p>
+<p>This platform replaces belief with measurement. Every tracked news release since 2020 (full history to 2015 via Full Resync) is recorded alongside what GBP/USD actually did in the minutes afterwards. Before any release, the platform states what has historically happened in that exact scenario. After any trade, it states what was actually achievable versus what was done.</p>
+
+<h2>1.2 The three jobs</h2>
+<ol>
+  <li><strong>Record.</strong> Every trade, with real money amounts, entry price, exit price, and honest notes.</li>
+  <li><strong>Analyse.</strong> Every historical news release, with the measured GBP/USD reaction attached.</li>
+  <li><strong>Inform.</strong> Before each release, produce a decision: trade or skip, which direction, what stop, what target, what size.</li>
+</ol>
+
+<h2>1.3 What it is not</h2>
+<p>It does not execute trades. Orders are placed manually in OANDA. Every automation boundary stops at advice.</p>
+<p>It is not a signal service. It reports what happened historically. It does not predict.</p>
+<p>It is not finished. It is a measurement instrument still being calibrated, and several of its readings were wrong until 19 July 2026 (section 10).</p>
+
+<!-- ── SECTION 2 ── -->
+<h1 id="s2">2. The trading strategy in plain terms</h1>
+
+<h2>2.1 The core idea</h2>
+<p>Economic data is released on a schedule. Before release, the market has a consensus <strong>forecast</strong>. When the <strong>actual</strong> number arrives, the gap is a surprise, and surprises move price. If a particular release has historically pushed GBP/USD in a consistent direction when it beats or misses, that is an edge worth trading. If the direction is inconsistent, it is a coin flip and should be skipped.</p>
+
+<h2>2.2 The rules</h2>
+<table>
+  <tr><th>Element</th><th>Rule</th></tr>
+  <tr><td>Instrument</td><td>GBP/USD only. No exceptions.</td></tr>
+  <tr><td>Timeframe</td><td>5-minute chart</td></tr>
+  <tr><td>Universe</td><td>28 named events (section 5.3), USD and GBP only</td></tr>
+  <tr><td>Impact filter</td><td>Red (high) and orange (medium) only. Yellow is ignored.</td></tr>
+  <tr><td>Entry</td><td>5 minutes after release, only if direction has held</td></tr>
+  <tr><td>Stop loss</td><td>15 pips minimum. 10 pips is too tight (section 10.4)</td></tr>
+  <tr><td>Target</td><td>Derived from historical post-entry movement, not a fixed ratio</td></tr>
+  <tr><td>Risk per trade</td><td>Fixed percentage of account, enforced by the app</td></tr>
+  <tr><td>Max trades per day</td><td>3</td></tr>
+  <tr><td>Daily loss limit</td><td>6 percent of account. No override.</td></tr>
+</table>
+
+<h2>2.3 Direction logic</h2>
+<p>For each event the system holds two statistics: <strong>Beat direction</strong> (when actual beat forecast, which way did GBP/USD go and how consistently) and <strong>Miss direction</strong> (same for misses).</p>
+<p>How the beat/miss comparison is made depends on the event's <code>value_type</code>, set per event in <code>NEWS_MAP</code>:</p>
+<ul>
+  <li><strong>percent</strong> (CPI, PMI, earnings, rates) and <strong>count_large</strong> (NFP, JOLTs): proportional 5% rule. Beat if actual is more than 5% above forecast, miss if more than 5% below, inline within that band.</li>
+  <li><strong>count_signed</strong> (Claimant Count Change — can print negative): absolute rule. Threshold = 10% of that event's historical standard deviation, because a proportional comparison is meaningless when forecast is near zero.</li>
+</ul>
+<p>A secondary safety trigger applies the absolute rule to any single row where forecast and actual have opposite signs, regardless of <code>value_type</code>. This handles volatile months on otherwise-proportional series (e.g. Retail forecast +0.5% actual -1.0%).</p>
+<div class="warn">The earlier single proportional rule was replaced on 21 July 2026 after it produced nonsensical labels on Claimant Count Change. A first-pass fix (switch to absolute when forecast &lt; 10) was also wrong — it confused "small number" with "near-zero series" and mislabelled clean percentage series like Average Earnings. The correct design tags each event explicitly. See sections 9.11 and bugs 10.14, 10.16.</div>
+
+<h2>2.4 Confidence thresholds</h2>
+<table>
+  <tr><th>Historical consistency</th><th>Verdict</th></tr>
+  <tr><td>75% or above</td><td>Strong signal, high confidence</td></tr>
+  <tr><td>60–74%</td><td>Moderate — confirm direction after release</td></tr>
+  <tr><td>50–59%</td><td>Weak — skip unless other factors align</td></tr>
+  <tr><td>Below 50%</td><td>Avoid — direction is unpredictable</td></tr>
+</table>
+
+<h2>2.5 Event quality ratings</h2>
+<p>A manual overlay held in <code>news_ratings</code>. Each event carries one of: <span class="badge-good">Good</span> · <span class="badge-caution">Caution</span> · <span class="badge-bad">Bad</span> · <span class="badge-vbad">Very Bad</span> · <span class="badge-unrel">Unreliable</span>. These are personal judgements. The statistics can contradict them, and when they do that contradiction is information worth examining.</p>
+
+<h2>2.6 Confluence rules for multiple events</h2>
+<p>When two or more tracked events release at the <strong>same timestamp</strong>, the platform uses measured joint statistics wherever it has 8+ joint occurrences. Below 8 it falls back to a tiebreaker: confidence gap ≥ 15 points, then surprise magnitude ≥ 1.5×, then occurrence count, then NO TRADE. NO TRADE from two evenly matched contradictory signals is a feature, not a fault.</p>
+
+<h2>2.7 Why country matters</h2>
+<p><strong>USD events</strong> move the quote currency — strong USD data typically pushes GBP/USD <em>down</em>. <strong>GBP events</strong> move the base — strong UK data typically pushes GBP/USD <em>up</em>. The interface shows the country flag everywhere. Never present an event without it.</p>
+
+<!-- ── SECTION 3 ── -->
+<h1 id="s3">3. System architecture</h1>
+
+<h2>3.1 High level</h2>
+<div class="flow">  [Forex Factory calendar]  ──cloudscraper──▶  [scraper.py]
+  [OANDA v20 REST API]       ──httpx──────────▶  [scraper.py]  ──▶  [db.py]  ──▶  [Supabase Postgres]
+  [OANDA v20 REST API]       ──httpx (proxied)▶  [app.py]      ──▶  [db.py]
+  [app.py]  ──JSON over fetch──▶  [public/index.html]  - - -reads advice- - -▶  [OANDA (manual)]</div>
+<div class="warn">The dotted line is the important one. The platform advises. A human executes. There is no automated order path and there should not be. Any change that has JavaScript calling api-fxpractice.oanda.com directly is broken before it is written (section 9.1).</div>
+
+<h2>3.2 Technology choices</h2>
+<table>
+  <tr><th>Layer</th><th>Choice</th><th>Why</th></tr>
+  <tr><td>Backend</td><td>FastAPI (Python)</td><td>Async HTTP for OANDA and scraping, minimal ceremony</td></tr>
+  <tr><td>Database</td><td>Supabase Postgres</td><td>Cloud-hosted, survives machine loss, proper SQL</td></tr>
+  <tr><td>Frontend</td><td>One HTML file, vanilla JS</td><td>No build step, no dependency drift, editable by anyone</td></tr>
+  <tr><td>News source</td><td>Forex Factory (scraped)</td><td>Free, complete history back to 2007, includes forecast and actual</td></tr>
+  <tr><td>Price source</td><td>OANDA v20 REST</td><td>Same broker as execution — data matches the fills</td></tr>
+  <tr><td>Cloudflare bypass</td><td>cloudscraper</td><td>Forex Factory returns 403 to plain HTTP clients</td></tr>
+  <tr><td>AI assistance</td><td>Cursor, guided by CURSOR_BRIEF.md</td><td>All code changes go through a written brief</td></tr>
+</table>
+
+<h2>3.3 File structure</h2>
+<pre>trading_app 3/
+├── app.py            FastAPI backend: routes, models, scoring, analytics
+├── scraper.py        FF scraper, OANDA reaction engine, co-occurrence builder, backfill
+├── db.py             Postgres connection wrapper (psycopg2)
+├── public/
+│   └── index.html    THE ENTIRE FRONTEND. HTML, CSS and JS in one file.
+├── schema.sql        Run once in the Supabase SQL editor
+├── requirements.txt
+├── start.sh          Mac startup script
+├── .env              DATABASE_URL (never committed)
+└── CURSOR_BRIEF.md   The contract every AI session must read first</pre>
+<p>There is exactly one frontend file. A second <code>index.html</code> at the project root existed briefly and was deleted. Do not recreate it.</p>
+
+<h2>3.4 The CORS constraint</h2>
+<p>The browser cannot call the OANDA API directly. OANDA rejects cross-origin browser requests. Every price call must travel: <code>browser → Python backend → OANDA → Python backend → browser</code>. This is why the first version (standalone HTML with localStorage) did not work at all.</p>
+
+<!-- ── SECTION 4 ── -->
+<h1 id="s4">4. The data pipeline</h1>
+
+<h2>4.1 Sync flow</h2>
+<div class="flow">  Sync triggered
+       │
+       ▼
+  Scrape Forex Factory (month by month)
+       │  filter: USD or GBP, red or orange impact
+       ▼
+  match_event()  →  keyword + exclusion list + impact guard
+       │
+       ├── no match  →  discard
+       │
+       └── match  →  save to news_events (upsert on name+date+time)
+                          │
+                          ▼
+                     classify beat / miss / inline vs forecast
+                          │
+                          ▼
+                     for each event with actual and no reaction:
+                     fetch OANDA 5M candles
+                          │
+                          ▼
+                     compute pips at 5m/15m/30m/60m
+                     signed + absolute, post-entry 5→30, max adverse
+                          │
+                          ▼
+                     save to price_reactions
+                          │
+                          ▼
+                     build_event_groups()
+                     mark is_co_released, record joint scenario
+                          │
+                          ▼
+                     statistics ready</div>
+
+<h2>4.2 The two calendar paths</h2>
+<p><strong>Analysis path</strong> (<code>scrape_month</code>, <code>watchlist_only=True</code>) — historical. Saves only watchlist matches to the database. Keeps statistics clean.</p>
+<p><strong>This Week path</strong> (<code>scrape_upcoming</code>) — forward-looking, next 7 days. Returns <em>all</em> USD and GBP red/orange events to the frontend so the calendar is complete, but still saves only watchlist matches. Non-watchlist events display with "Not on watchlist yet" and a disabled brief button.</p>
+
+<h2>4.3 How a price reaction is measured</h2>
+<p>OANDA 5-minute mid candles are fetched from 15 minutes before to 75 minutes after the release.</p>
+<ul>
+  <li><code>open_price</code> = open of the candle beginning at the release timestamp (index 3 in the window)</li>
+  <li><code>price_5m/15m/30m/60m</code> = closes at those offsets</li>
+  <li><code>signed_pip_X</code> = <code>(price_X − open_price) × 10000</code>, positive = price rose</li>
+  <li><code>pip_X</code> = absolute value, kept for backwards compatibility</li>
+  <li><code>post_entry_5_30</code> = <code>(price_30m − price_5m) × 10000</code>, sign-corrected so positive always means "continued in the direction it was moving at minute 5"</li>
+  <li><code>max_adverse_5_30</code> = largest move <em>against</em> the 5-minute direction between minutes 5 and 30, in pips</li>
+</ul>
+<div class="info"><strong><code>post_entry_5_30</code> is the single most important number in the database.</strong> See section 9.5.</div>
+
+<!-- ── SECTION 5 ── -->
+<h1 id="s5">5. Database</h1>
+
+<h2>5.1 Tables</h2>
+<table>
+  <tr><th>Table</th><th>Purpose</th><th>Populated by</th></tr>
+  <tr><td><code>trades</code></td><td>Every trade, live and backtested</td><td>Human, via UI</td></tr>
+  <tr><td><code>news_events</code></td><td>One row per news release occurrence</td><td>Scraper</td></tr>
+  <tr><td><code>price_reactions</code></td><td>GBP/USD reaction to each release</td><td>Scraper via OANDA</td></tr>
+  <tr><td><code>event_groups</code></td><td>Same-timestamp release pairs and joint outcomes</td><td><code>build_event_groups()</code></td></tr>
+  <tr><td><code>news_ratings</code></td><td>Personal quality rating per event type</td><td>Human, seeded</td></tr>
+  <tr><td><code>settings</code></td><td>OANDA credentials, risk configuration</td><td>Human</td></tr>
+  <tr><td><code>sync_log</code></td><td>One row per sync run</td><td>Scraper</td></tr>
+</table>
+
+<h2>5.2 Key columns worth knowing</h2>
+<p><strong>trades:</strong> <code>date, news1/2/3, entry, news_event_id, trade_type</code> ("live" or "backtesting") · <code>account_balance, risk_percent, risk_amount, lot_size, entry_price, exit_price, pnl, spread_at_entry, direction</code> · <code>outcome, ratio, sl, improvement</code></p>
+<div class="warn">The <code>trade_type</code> split is permanent. The original rows from the Excel log are <em>backtesting</em>. Real-money trades from 20 July 2026 are <em>live</em>. Never merge them — mixing simulated and real results produces a performance number that means nothing.</div>
+<p><strong>price_reactions:</strong> <code>pip_5m/15m/30m/60m</code> (absolute) · <code>signed_pip_*</code> (directional) · <code>post_entry_5_30, post_entry_5_60, max_adverse_5_30</code> · <code>direction_5m/15m, open_price, price_5m/15m/30m/60m, is_co_released</code></p>
+<p><strong>news_events:</strong> includes <code>classification_method</code> ("proportional" or "absolute") recording which rule was applied to each beat/miss label.</p>
+<p><strong>event_groups:</strong> <code>group_key</code> (pipe-joined sorted member names) · <code>event_date, event_time, scenario</code> (pipe-joined beat/miss values) · <code>price_reaction_id</code></p>
+
+<h2>5.3 The tracked events (28)</h2>
+<p>As of 21 July 2026 the watchlist holds 28 events. Average Earnings UK was added that day because it releases at 07:00 on UK labour-market day at the same timestamp as Claimant Count Change, and the platform was previously blind to it.</p>
+<table>
+  <tr><th>Event</th><th>Country</th><th>Rating</th><th>value_type</th></tr>
+  <tr><td>Non Farm Payroll US</td><td>USD</td><td class="badge-good">Good</td><td>count_large</td></tr>
+  <tr><td>Unemployment US</td><td>USD</td><td class="badge-good">Good</td><td>percent</td></tr>
+  <tr><td>ISM Services US</td><td>USD</td><td class="badge-good">Good</td><td>percent</td></tr>
+  <tr><td>Retail UK</td><td>GBP</td><td class="badge-good">Good</td><td>percent</td></tr>
+  <tr><td>GDP UK</td><td>GBP</td><td class="badge-good">Good</td><td>percent</td></tr>
+  <tr><td>Existing Home Sales US</td><td>USD</td><td class="badge-good">Good</td><td>count_large</td></tr>
+  <tr><td>Core Inflation MoM US</td><td>USD</td><td class="badge-good">Good</td><td>percent</td></tr>
+  <tr><td>Inflation Rate YoY US</td><td>USD</td><td class="badge-caution">Caution</td><td>percent</td></tr>
+  <tr><td>Inflation Rate YoY UK</td><td>GBP</td><td class="badge-caution">Caution</td><td>percent</td></tr>
+  <tr><td>FOMC US</td><td>USD</td><td class="badge-caution">Caution</td><td>percent</td></tr>
+  <tr><td>Building Permits US</td><td>USD</td><td class="badge-caution">Caution</td><td>count_large</td></tr>
+  <tr><td>Housing Starts US</td><td>USD</td><td class="badge-caution">Caution</td><td>count_large</td></tr>
+  <tr><td>S&amp;P Global Manufacturing PMI UK</td><td>GBP</td><td class="badge-caution">Caution</td><td>percent</td></tr>
+  <tr><td>S&amp;P Global Services PMI UK</td><td>GBP</td><td class="badge-caution">Caution</td><td>percent</td></tr>
+  <tr><td>BOE Interest Rate US</td><td>GBP</td><td class="badge-caution">Caution</td><td>percent</td></tr>
+  <tr><td>Fed Chair Powell Speech US</td><td>USD</td><td class="badge-caution">Caution</td><td>percent</td></tr>
+  <tr><td>ISM Manufacturing US</td><td>USD</td><td class="badge-bad">Bad</td><td>percent</td></tr>
+  <tr><td>Personal Spending US</td><td>USD</td><td class="badge-bad">Bad</td><td>percent</td></tr>
+  <tr><td>Core PCE MoM US</td><td>USD</td><td class="badge-bad">Bad</td><td>percent</td></tr>
+  <tr><td>PPI US</td><td>USD</td><td class="badge-bad">Bad</td><td>percent</td></tr>
+  <tr><td>PPI MoM US</td><td>USD</td><td class="badge-bad">Bad</td><td>percent</td></tr>
+  <tr><td>Michigan Consumer Sentiment US</td><td>USD</td><td class="badge-bad">Bad</td><td>percent</td></tr>
+  <tr><td>Retail US</td><td>USD</td><td class="badge-vbad">Very Bad</td><td>percent</td></tr>
+  <tr><td>Durable Goods US</td><td>USD</td><td class="badge-bad">Bad</td><td>percent</td></tr>
+  <tr><td>JOLTs Job Openings US</td><td>USD</td><td class="badge-bad">Bad</td><td>count_large</td></tr>
+  <tr><td>GDP US</td><td>USD</td><td class="badge-unrel">Unreliable</td><td>percent</td></tr>
+  <tr><td>Unemployment UK</td><td>GBP</td><td class="badge-bad">Bad</td><td>count_signed</td></tr>
+  <tr><td>Average Earnings UK</td><td>GBP</td><td class="badge-caution">Caution</td><td>percent</td></tr>
+</table>
+
+<p><strong>Known co-release pairs</strong> (always release at the same timestamp):</p>
+<ul>
+  <li>Non Farm Payroll US + Unemployment US — first Friday monthly</li>
+  <li>S&amp;P Global Manufacturing PMI UK + S&amp;P Global Services PMI UK — Flash PMI day</li>
+  <li>Unemployment UK (Claimant Count Change) + Average Earnings UK — UK labour-market day at 07:00</li>
+</ul>
+
+<div class="warn"><strong>Naming caveat on Unemployment UK.</strong> The entry named "Unemployment UK" is mapped by keyword to <em>Claimant Count Change</em>, not to the UK Unemployment Rate percentage. All 101+ historical rows are Claimant Count Change. The recommended resolution is to rename the entry to "Claimant Count UK". It has not been renamed yet.</div>
+
+<div class="warn"><strong>BOE Interest Rate US.</strong> The keyword "BOE" does not match the real rate-decision titles ("Official Bank Rate", "Monetary Policy Summary"). The entry currently has zero rows of actual rate-decision data — all historical rows were speeches and were deleted (bug 10.15). The keyword must be updated before it captures real data.</div>
+
+<!-- ── SECTION 6 ── -->
+<h1 id="s6">6. The application, page by page</h1>
+<table>
+  <tr><th>Page</th><th>Purpose</th></tr>
+  <tr><td><strong>This Week</strong></td><td>Next 7 days of USD/GBP releases. Entry point for every trade.</td></tr>
+  <tr><td><strong>Live Trades</strong></td><td>Real-money trades, account balance, P&amp;L, position size calculator, daily limits</td></tr>
+  <tr><td><strong>Dashboard</strong></td><td>Headline statistics and live GBP/USD price</td></tr>
+  <tr><td><strong>Performance</strong></td><td>Win rate over time, performance by event and timing, improvement tracker</td></tr>
+  <tr><td><strong>Analysis</strong></td><td>Per-event historical statistics with filters. The research surface.</td></tr>
+  <tr><td><strong>Journal</strong></td><td>Every recorded news occurrence (All Events) plus the trade log (My Trades)</td></tr>
+  <tr><td><strong>News Scorer</strong></td><td>Manual confluence check: enter 1–3 events, get GO / CAUTION / NO TRADE</td></tr>
+  <tr><td><strong>Log Trade</strong></td><td>Manual trade entry for trades taken away from the platform</td></tr>
+  <tr><td><strong>News Ratings</strong></td><td>Edit the personal quality rating and notes for each event</td></tr>
+  <tr><td><strong>Settings</strong></td><td>OANDA credentials, risk config, sync controls, match audit, backfill</td></tr>
+  <tr><td><strong>Blueprint</strong></td><td>This document</td></tr>
+</table>
+
+<h2>6.1 The Pre-Trade Brief</h2>
+<p>Opened from This Week for any watchlist event. Seven sections: header, Live Trade Assistant, decision tree (IF BEAT / IF MATCH / IF MISS), magnitude, what the data says, trade plan (6-step checklist), warnings and history.</p>
+
+<h2>6.2 The Live Trade Assistant (4 stages)</h2>
+<p><strong>Stage A:</strong> Enter the actual number. System classifies beat/miss/match and issues BUY, SELL or SKIP with confidence and expected move.</p>
+<p><strong>Stage B:</strong> 5-minute countdown that cannot be skipped. Live GBP/USD polls every 15 seconds. Spread normalises; initial spikes frequently reverse.</p>
+<p><strong>Stage C:</strong> At zero, checks whether direction held. Green = entry with position calculator. Red = reversal, do not trade. Amber = weak, consider skipping. Entry price and lot size required before proceeding.</p>
+<p><strong>Stage D:</strong> Live P&amp;L in pounds, progress bar between stop and target. On close, exit price is captured and the row is written as a live trade.</p>
+
+<h2>6.3 Multi-event handling</h2>
+<p>When 2+ watchlist events release within 30 minutes: This Week shows a Combined Brief button. If 8+ joint occurrences exist, it uses measured joint statistics. Below 8 it uses the tiebreaker cascade. The fallback returning NO TRADE is intentional.</p>
+
+<!-- ── SECTION 7 ── -->
+<h1 id="s7">7. The trading workflow</h1>
+<div class="flow">  SUNDAY
+  ├─ Open This Week
+  ├─ Note the week's releases
+  └─ Set Investing.com alerts, 15 min before each
+
+  15 MIN BEFORE (alert fires)
+  ├─ Open the Pre-Trade Brief
+  ├─ Read the decision tree
+  └─ Are daily limits already hit?
+      ├─ YES → STOP. No trade today.
+      └─ NO  → continue
+
+  AT RELEASE
+  ├─ Read actual from Investing.com
+  └─ Type it into Live Mode
+      ├─ SKIP / MATCH → close the brief
+      └─ BUY or SELL  → continue
+
+  WAIT 5 MINUTES (Stage B countdown — cannot skip)
+  └─ Is direction still holding?
+      ├─ NO  → DO NOT TRADE. Reversal or fakeout.
+      └─ YES → continue
+
+  SIZE THE POSITION
+  └─ Calculator: balance × risk% ÷ (stop × pip_value)
+
+  EXECUTE IN OANDA (manual)
+  └─ Place order, set stop and target
+
+  RECORD (Stage C)
+  └─ Entry price + lot size
+
+  TRACK (Stage D)
+  └─ Live P&amp;L until close → enter exit price → saved as live trade
+
+  WEEKLY REVIEW
+  └─ Performance page: what you could have done on every trade</div>
+
+<h2>7.1 Desk setup at release time</h2>
+<ol>
+  <li>GBP/USD 5-minute chart in OANDA</li>
+  <li>The Pre-Trade Brief at <code>localhost:8000</code></li>
+  <li>Investing.com economic calendar, filtered to the relevant currency</li>
+</ol>
+
+<h2>7.2 News sources</h2>
+<table>
+  <tr><th>Purpose</th><th>Source</th></tr>
+  <tr><td>Scheduled calendar and release times</td><td>Investing.com app, alerts 15 minutes before</td></tr>
+  <tr><td>Actual numbers at release</td><td>Investing.com calendar, live</td></tr>
+  <tr><td>Breaking unscheduled news</td><td>@ForexLive and @ReutersUK, notifications on</td></tr>
+  <tr><td>Background context</td><td>Google Alert on GBP/USD, "as it happens"</td></tr>
+</table>
+
+<h2>7.3 The three news categories</h2>
+<p><strong>Category A — scheduled economic data.</strong> The platform handles this completely. This is the strategy.</p>
+<p><strong>Category B — semi-scheduled events</strong> (Fed speeches, BOE press conferences). On the calendar but no forecast. Lower confidence, treat with caution.</p>
+<p><strong>Category C — unscheduled shocks</strong> (political events, geopolitical). The platform has nothing to say. No historical data, no forecast, no edge. Rule: if you did not know about it before it happened, do not chase it. By the time you hear, the first 20–50 pips are gone and what remains is reversal risk.</p>
+
+<!-- ── SECTION 8 ── -->
+<h1 id="s8">8. Risk management</h1>
+
+<h2>8.1 The framework</h2>
+<table>
+  <tr><th>Parameter</th><th>Setting</th><th>Where</th></tr>
+  <tr><td>Starting balance</td><td>£5,000</td><td><code>settings.starting_balance</code></td></tr>
+  <tr><td>Risk per trade</td><td>Recommended 2% (£100)</td><td><code>settings.default_risk_pct</code></td></tr>
+  <tr><td>Daily loss limit</td><td>6%</td><td><code>settings.daily_loss_limit_pct</code></td></tr>
+  <tr><td>Max trades per day</td><td>3</td><td><code>settings.max_trades_per_day</code></td></tr>
+  <tr><td>Minimum stop</td><td>15 pips</td><td>Enforced with a warning</td></tr>
+</table>
+
+<h2>8.2 Position size formula</h2>
+<pre>pip_value_gbp_per_lot = 10 / current_GBPUSD_rate
+risk_amount           = balance × (risk_percent / 100)
+lot_size              = risk_amount / (stop_pips × pip_value_gbp_per_lot)
+
+Example: £5,000, 2%, 15-pip stop, rate 1.3400
+  pip_value = 10 / 1.34        = £7.46 per lot per pip
+  risk      = 5000 × 0.02      = £100
+  lot_size  = 100 / (15 × 7.46) = 0.89 lots</pre>
+
+<h2>8.3 Why 2% and not 10%</h2>
+<table>
+  <tr><th>Consecutive losses</th><th>At 2%</th><th>At 10%</th></tr>
+  <tr><td>1</td><td>£4,900</td><td>£4,500</td></tr>
+  <tr><td>3</td><td>£4,706</td><td>£3,645</td></tr>
+  <tr><td>5</td><td>£4,520</td><td>£2,952</td></tr>
+  <tr><td>10</td><td>£4,086</td><td>£1,743</td></tr>
+  <tr><td>Recovery needed after 5</td><td>10.6%</td><td>69%</td></tr>
+  <tr><td>Recovery needed after 10</td><td>22%</td><td>187%</td></tr>
+</table>
+<p>At a 57% win rate, a run of five consecutive losses should be expected once or twice per hundred trades. At 2%, that is an inconvenience. At 10%, it ends the account. Note also that a 10% per-trade risk is incompatible with a 6% daily loss limit: one loss would breach the day.</p>
+
+<h2>8.4 The hard stops</h2>
+<p>These are enforced in code with no override button, deliberately: daily loss limit reached → Live Trade Assistant refuses to run; max trades reached → same; 5-minute wait → cannot be shortened. The absence of an override is the point.</p>
+
+<h2>8.5 Spread</h2>
+<p>At a red-impact release the GBP/USD spread widens from roughly 1 pip to 5–15 pips for several seconds. A 10-pip stop with an 8-pip spread is not a stop, it is an instant loss. Two consequences: stops must be at least 15 pips, and the 5-minute wait is doing real work because spread has usually normalised by then.</p>
+
+<!-- ── SECTION 9 ── -->
+<h1 id="s9">9. Design decisions and the reasoning behind them</h1>
+<p style="color:var(--text2);font-size:13px">Code shows what. This section shows why. Anyone changing this system needs the reasoning, not just the rules.</p>
+
+<h2>9.1 Why the browser never calls OANDA</h2>
+<p>OANDA blocks cross-origin browser requests. The first version of this platform was a single HTML file with localStorage, and it could not fetch a single price. This is the origin of the entire backend.</p>
+
+<h2>9.2 Why This Week shows non-watchlist events but does not save them</h2>
+<p>The calendar should be complete so nothing is missed. The statistics should be narrow so they are not diluted. Displaying everything while saving only the 28 tracked events achieves both.</p>
+
+<h2>9.3 Why co-released events are handled separately</h2>
+<p>When two watchlist events share a timestamp, one price move is recorded as two rows. If one beat and one missed, the same upward move is filed as "beat leads to up" for one and "miss leads to up" for the other. Over many occurrences this manufactures two contradictory statistics from a single dataset — exactly why Manufacturing PMI and Services PMI produced opposite signals.</p>
+<p>Fix: <code>event_groups</code> records the joint scenario. <code>is_co_released</code> excludes those rows from per-event direction statistics. Events with fewer than 5 solo occurrences show no direction and point to the Combined Brief.</p>
+
+<h2>9.4 Why the baseline is the candle open at release</h2>
+<p><code>open_price</code> originally used the close of the first candle in the fetch window, sitting 10–15 minutes <em>before</em> the release. Every pip figure included pre-release drift, inflating numbers and polluting direction statistics. Corrected to <code>candles[3]["mid"]["o"]</code> — the open of the candle beginning at the release timestamp.</p>
+
+<h2>9.5 Why post-entry movement is the number that matters</h2>
+<p>Entry happens five minutes after release. The 0–5 minute move is not capturable — it is the bus that has already left. <code>post_entry_5_30</code> is how far price travelled <em>after</em> the entry point. Unemployment US had 19.1 pips at 5 minutes but only 20.9 at 30 minutes — roughly 2 pips available after entry. A 1:5 target on a 10-pip stop needs 50 pips and was never reachable.</p>
+
+<h2>9.6 Why absolute pips were not enough</h2>
+<p><code>abs()</code> hides direction. 20.9 pips at 30 minutes could mean price continued 2 pips further, or reversed 40 pips against the position. Signed columns were added because those two outcomes are indistinguishable otherwise.</p>
+
+<h2>9.7 Why NEWS_MAP needs exclusion lists</h2>
+<p><code>match_event</code> used a substring test. "Non-Farm Employment Change" is contained within "ADP Non-Farm Employment Change", so ADP was silently filed as NFP. "BOE" caught every speech, minutes and testimony. Each entry now carries an exclusion list plus an impact guard. Match Audit in Settings shows which Forex Factory titles each tracked event is currently absorbing.</p>
+
+<h2>9.8 Why event_groups only populates during sync</h2>
+<p>Group detection needs the complete set of events for a timestamp, which only exists after a scrape completes. After deploying anything that touches it, one sync must run before the Combined Brief has data.</p>
+
+<h2>9.9 Why live and backtesting trades are separate</h2>
+<p>Mixing simulated results with real ones produces a performance figure that means nothing. Different psychology, different execution quality, different slippage.</p>
+
+<h2>9.10 Why nothing is automated end to end</h2>
+<p>Automated execution removes the pause in which a person notices something feels wrong. That pause has more value at this stage than the speed lost.</p>
+
+<h2>9.11 Why beat/miss is chosen by value_type, not by number size</h2>
+<p>A single proportional threshold breaks on any series that operates near or across zero. Claimant Count Change ranges from about −171K to +860K, so proportional comparison produces meaningless results.</p>
+<p>The first fix attempt switched to absolute mode whenever forecast &lt; 10. That confused "small number" with "near-zero series" — a 4.5% earnings figure is a small number but never approaches zero. The evidence: the flawed heuristic changed 1,001 historical rows; the correct value_type approach changed only 429, the difference being the misfires it removed.</p>
+<p>The correct design tags each event with what its numbers actually are: <code>percent</code>, <code>count_large</code>, or <code>count_signed</code>. Method follows from the tag. Only genuinely signed series use the absolute rule.</p>
+
+<h2>9.12 Why Flash and Final PMI must be separated</h2>
+<p>Flash PMI (around the 23rd) is the market mover. Final PMI (~10 days later) is a revision that moves price very little. A keyword matching both merged 82 Flash rows with 69 Final rows. Final is now excluded via the exclusion list.</p>
+
+<!-- ── SECTION 10 ── -->
+<h1 id="s10">10. Bugs found and fixed</h1>
+<div class="warn">Read this section before writing code. Each entry cost hours to find.</div>
+
+<h2>10.1 TradingView has no public data API</h2>
+<p>Third-party "TradingView API" services operate in a grey area and break without notice. OANDA was chosen because it is also the execution broker, so the data matches the fills.</p>
+
+<h2>10.2 Browser storage and CORS</h2>
+<p>Version one was a single HTML file using localStorage. It failed on both counts: OANDA blocked the requests, and clearing the browser would have destroyed the trade history.</p>
+
+<h2>10.3 Forex Factory blocks plain HTTP clients</h2>
+<p>Returns 403 to httpx with normal headers. Requires cloudscraper. FF has also changed its date format at least once. <strong>The scraper will break again.</strong> A sync reporting zero new events should be treated as a fault, not as "no news this week".</p>
+
+<h2>10.4 Ten-pip stops do not survive news releases</h2>
+<p>See section 8.5. Minimum 15.</p>
+
+<h2>10.5 The settings save and test race condition</h2>
+<p>The connection test read credentials from the database while the save was still committing. Fixed by passing credentials directly in the test request.</p>
+
+<h2>10.6 SQLite to Postgres migration left a dialect trap</h2>
+<p>An AI session wrote BIGSERIAL while the brief still documented SQLite. Because table creation was wrapped in try/except, the failure was swallowed and the table never existed, with no error and a permanent zero in the UI. <strong>Any silently-failing schema change is more dangerous than a loud one.</strong></p>
+
+<h2>10.7 Duplicate frontend files</h2>
+<p>Two index.html files existed briefly. Root one deleted. One frontend file, at <code>public/index.html</code>.</p>
+
+<h2>10.8 The measurement baseline was 15 minutes early</h2>
+<p>Section 9.4.</p>
+
+<h2>10.9 Absolute values hid reversals</h2>
+<p>Section 9.6.</p>
+
+<h2>10.10 One price move counted twice</h2>
+<p>Section 9.3.</p>
+
+<h2>10.11 Substring matching false positives (five distinct instances)</h2>
+<ol>
+  <li><strong>ADP filed as NFP.</strong> ~78 rows removed. Proof of fix: NFP and Unemployment US now show equal occurrence counts (~139), as they must since they always co-release.</li>
+  <li><strong>Speeches filed as FOMC.</strong> ~364 "FOMC Member Speaks" rows removed.</li>
+  <li><strong>Speeches, letters and surveys filed as BOE Interest Rate.</strong> ~228 rows removed. See also 10.15.</li>
+  <li><strong>GDP revisions filed as GDP.</strong> Prelim, Final, Second Estimate and Price Index excluded.</li>
+  <li><strong>Final PMI filed as Flash PMI.</strong> ~140 Final rows removed. Section 9.12.</li>
+</ol>
+<p>~878 rows removed in one pass across these sessions, plus further rows in later passes. General lesson: substring matching against titles that share words will always eventually mis-match. Audit every event against its real Forex Factory titles.</p>
+
+<h2>10.12 Price reactions never fetched for recently saved events</h2>
+<p>This Week saved events but only sync fetched reactions. Fixed with <code>backfill_missing_reactions()</code>, running at end of every sync and on application startup.</p>
+
+<h2>10.13 The brief was regenerated from scratch and lost its reasoning</h2>
+<p>An AI session concluded CURSOR_BRIEF.md did not exist and rebuilt it from code. A brief written from code describes what the code does but cannot recover why. Strategy section, confluence rules, and the do-not-do list were lost. <strong>This is the most dangerous class of failure in the project</strong> — it removes guardrails without removing functionality. Keep a copy outside the repository. This happened twice.</p>
+
+<h2>10.14 Beat/miss broke on near-zero series</h2>
+<p>The single proportional threshold produced meaningless labels on Claimant Count Change. See 9.11. First fix introduced a worse bug (10.16). Resolved with the value_type system.</p>
+
+<h2>10.15 The Bank of England rate decision was never captured</h2>
+<p>The keyword "BOE" only ever matched speeches and minutes. The real rate decision ("Official Bank Rate" / "Monetary Policy Summary" / "MPC Official Bank Rate Votes") contains no "BOE". Every BOE Interest Rate row was a speech. After the speech rows were correctly deleted the event sits at zero and requires a keyword change to capture real data.</p>
+
+<h2>10.16 The "small number" heuristic misfired on percentage series</h2>
+<p>First attempt at fixing 10.14 switched to absolute threshold whenever forecast &lt; 10, wrongly catching Average Earnings (4.5%), CPI (2.8%), Core PCE (0.3%). It flipped 1,001 rows when only ~429 should have changed. Replaced by the value_type approach (9.11).</p>
+
+<h2>10.17 Two events at one timestamp, one of them invisible</h2>
+<p>On UK labour-market day, Average Earnings Index releases alongside Claimant Count Change at 07:00. It was not on the watchlist, so the platform saw only half of what moved the market and could not co-release-adjust. Fixed by adding Average Earnings UK. General risk remains: periodically scan This Week for "Not on watchlist yet" events sitting at the same time as a tracked one.</p>
+
+<!-- ── SECTION 11 ── -->
+<h1 id="s11">11. Health checks</h1>
+<p style="color:var(--text2);font-size:13px">Run these periodically. The system can be confidently wrong.</p>
+
+<h2>11.1 Is the clock right?</h2>
+<p>In Journal → All Events, find any NFP row. The time column should read 1:30pm (13:30 UTC). If it reads 8:30am, the app is storing Eastern time as UTC and every US statistic is measured five hours off target.</p>
+
+<h2>11.2 Is event matching clean?</h2>
+<p>Settings → Match Audit. Any event showing more than one distinct Forex Factory title is suspect:</p>
+<ul>
+  <li>NFP should show no title containing "ADP". Count should equal Unemployment US almost exactly.</li>
+  <li>GDP should not show "Prelim", "Final", "Second Estimate" or "Price Index".</li>
+  <li>BOE Interest Rate should show "Official Bank Rate" or "Monetary Policy Summary" — not speeches, minutes, letters or surveys. If it is empty, the keyword needs changing (10.15).</li>
+  <li>The two PMI events should show only "Flash" titles, never "Final".</li>
+  <li>FOMC should not show "Member Speaks".</li>
+</ul>
+
+<h2>11.3 Are price reactions complete?</h2>
+<p>Settings shows "Missing price reactions". This should be zero (ignoring future events). If large, run Backfill.</p>
+
+<h2>11.4 Are co-occurrence groups built?</h2>
+<p>Settings shows the group count. Zero means <code>build_event_groups()</code> has not run or is failing silently, and the Combined Brief is falling back to the tiebreaker without saying so.</p>
+
+<h2>11.5 Do the pip figures look plausible?</h2>
+<p>Spot-check any NFP row. NFP typically moves GBP/USD 20–60 pips. If a row shows 2 pips, either the timestamp is wrong or candles were fetched for the wrong window.</p>
+
+<h2>11.6 Is post-entry data populated?</h2>
+<p>Analysis page. The Post-Entry column should hold numbers differing from the 5M column. Identical values mean the calculation is wired wrong. Empty values mean a resync is needed, and "What This Means" should read "No post-entry data yet — run Sync Now".</p>
+
+<h2>11.7 Is beat/miss using the right method per event?</h2>
+<p>Percentage series (CPI, PMI, earnings, rates) and large-count series (NFP, JOLTs) should read "proportional" in <code>classification_method</code>. Only Claimant Count Change should read "absolute" consistently. Scattered absolute rows on volatile percentage series (opposite-sign months) are expected and correct. If CPI or NFP shows large numbers of absolute rows, the value_type tagging is wrong (10.16).</p>
+
+<!-- ── SECTION 12 ── -->
+<h1 id="s12">12. Running and maintaining</h1>
+
+<h2>12.1 Start the app</h2>
+<pre>cd "/Users/yafetwolde/Downloads/trading_app 3"
+python app.py</pre>
+<p>Opens at <code>http://localhost:8000</code>. Stop with Ctrl+C. First time: <code>pip install -r requirements.txt</code>.</p>
+<p><code>.env</code> must contain the Supabase connection pooler URI (port 6543):</p>
+<pre>DATABASE_URL=postgresql://postgres.[ref]:[password]@aws-0-eu-west-2.pooler.supabase.com:6543/postgres</pre>
+
+<h2>12.2 Sync operations</h2>
+<table>
+  <tr><th>Operation</th><th>Range</th><th>Duration</th><th>When</th></tr>
+  <tr><td>Sync Now</td><td>Jan 2020 to today</td><td>Minutes</td><td>Weekly, or after any scraper change</td></tr>
+  <tr><td>Full Resync</td><td>Jan 2015 to today</td><td>2–3 hours</td><td>After a measurement change. Run overnight.</td></tr>
+  <tr><td>Backfill</td><td>Missing reactions only</td><td>Minutes</td><td>When the Settings count is non-zero</td></tr>
+</table>
+<p>Order after any change touching measurement or matching: (1) re-check event matching with dry run, read the deletion list; (2) confirm reclassification; (3) Sync Now, verify numbers; (4) Full Resync overnight.</p>
+
+<h2>12.3 Making code changes</h2>
+<p>All changes go through Cursor, and every session starts by reading <code>CURSOR_BRIEF.md</code>. The brief is the contract. When behaviour changes, the brief changes in the same session. A brief that drifts out of date is worse than no brief.</p>
+
+<h2>12.4 Backups</h2>
+<p>Currently a gap. Supabase holds everything and there is no export. Add a scheduled dump.</p>
+
+<!-- ── SECTION 13 ── -->
+<h1 id="s13">13. Known limitations</h1>
+<ul>
+  <li><strong>Sample size.</strong> After the 2015 resync most monthly events hold ~130–216 occurrences. Direction consistency across most events sits between 50–68%, which is only modestly better than a coin flip. The honest reading: the post-entry movement on most events is small, and few support the original 1:5 target. The statistics are now trustworthy; the strategy itself is still unproven until live trades confirm it.</li>
+  <li><strong>Track record.</strong> Zero live trades at time of original writing (21 July 2026). There is no demonstrated edge yet — there is a well-constructed hypothesis.</li>
+  <li><strong>Scraper fragility.</strong> Forex Factory is scraped, not licensed. It has broken once and will break again, usually quietly.</li>
+  <li><strong>No historical spread data.</strong> Reactions are computed from mid prices. Historical figures are slightly optimistic.</li>
+  <li><strong>Timezone mostly verified.</strong> NFP checks out at 13:30 UTC. UK 07:00 releases check out. No timezone conversion error has been confirmed, but not every event has been individually checked.</li>
+  <li><strong>No backup.</strong> Section 12.4.</li>
+  <li><strong>Local only.</strong> The app runs on one machine. If it is not running at release time, there is no advice.</li>
+</ul>
+
+<!-- ── SECTION 14 ── -->
+<h1 id="s14">14. Roadmap</h1>
+
+<h2>Now — verification, not expansion</h2>
+<p>The next fifty trades are about execution and honest record-keeping. Minimum position size. One trade per session, not three. Every trade logged with entry price, exit price and lot size.</p>
+
+<h2>After ~30 live trades</h2>
+<p>Review Performance seriously. Which events actually produce wins? Is entry timing working? Is win rate trending?</p>
+
+<h2>After ~50 live trades</h2>
+<p>Performance data becomes meaningful. Trim the watchlist to events that are demonstrably working. Most traders end up with 3–5 reliable setups, not 28.</p>
+
+<h2>After ~100 live trades</h2>
+<p>Statistical confidence. Only now does position size scaling become defensible.</p>
+
+<h2>Not yet</h2>
+<ul>
+  <li><strong>AI / machine learning.</strong> Small datasets plus ML produce confident nonsense. Revisit at 100+ live trades.</li>
+  <li><strong>Hosting.</strong> Only worth doing when the local setup becomes the constraint.</li>
+  <li><strong>More pairs.</strong> GBP/USD until it works.</li>
+  <li><strong>More features.</strong> The platform is sufficient for the next fifty trades. Feature-building is the most comfortable way to avoid trading, and it feels productive while producing nothing.</li>
+</ul>
+
+<!-- ── SECTION 15 ── -->
+<h1 id="s15">15. Onboarding a new contributor</h1>
+
+<h2>15.1 Read in this order</h2>
+<ol>
+  <li>This document, sections 1, 2, 3</li>
+  <li><code>CURSOR_BRIEF.md</code> in full, especially the rules section</li>
+  <li>Section 10 of this document — the bug list</li>
+  <li><code>scraper.py</code>: specifically <code>match_event</code>, <code>fetch_price_reaction</code>, <code>build_event_groups</code></li>
+  <li><code>app.py</code>: the route list</li>
+  <li><code>public/index.html</code>: the render functions</li>
+</ol>
+
+<h2>15.2 Do not</h2>
+<ul>
+  <li>Add React, Vue, npm, or any build step</li>
+  <li>Create a second HTML file</li>
+  <li>Call OANDA from the browser</li>
+  <li>Change NEWS_MAP event names or keywords — only exclusion lists and value_type tags, and only when asked</li>
+  <li>Add a new keyword to NEWS_MAP without first checking the raw Forex Factory titles it will match. Substring collisions are the most common bug in this system.</li>
+  <li>Choose a beat/miss method from the size of a number. Method comes from the event's declared value_type, never from <code>abs(forecast) &lt; n</code></li>
+  <li>Delete rows from <code>price_reactions</code> except through the reclassify endpoint, with the dry-run list read and confirmed first</li>
+  <li>Change the colour scheme or fonts</li>
+  <li>Remove any risk limit or add an override to one</li>
+  <li>Use localStorage for anything persistent</li>
+  <li>Regenerate <code>CURSOR_BRIEF.md</code> from scratch</li>
+</ul>
+
+<h2>15.3 Always</h2>
+<ul>
+  <li>Read <code>CURSOR_BRIEF.md</code> before touching anything</li>
+  <li>Use <code>%s</code> placeholders — this is Postgres</li>
+  <li>Wrap database operations in try/except, but <strong>verify they actually succeeded</strong> rather than trusting the absence of an error</li>
+  <li>Render every number in JetBrains Mono</li>
+  <li>Show the country flag wherever an event appears</li>
+  <li>Update the brief in the same session as the change</li>
+</ul>
+
+<h2>15.4 First task for a new contributor</h2>
+<p>Set up locally, run the six health checks in section 11, and report what is wrong. Something will be. That exercise teaches the pipeline faster than reading the code.</p>
+
+<!-- ── SECTION 16 ── -->
+<h1 id="s16">16. Glossary</h1>
+<table>
+  <tr><th>Term</th><th>Meaning</th></tr>
+  <tr><td><strong>Pip</strong></td><td>0.0001 on GBP/USD. The standard unit of price movement.</td></tr>
+  <tr><td><strong>Spread</strong></td><td>Gap between buy and sell price. ~1 pip normally, 5–15 at news release.</td></tr>
+  <tr><td><strong>Lot</strong></td><td>Position size. One standard lot = 100,000 units, ~$10 per pip.</td></tr>
+  <tr><td><strong>Beat</strong></td><td>Actual came in above forecast</td></tr>
+  <tr><td><strong>Miss</strong></td><td>Actual came in below forecast</td></tr>
+  <tr><td><strong>Inline / Match</strong></td><td>Actual within 5% of forecast (proportional) or within abs_threshold (absolute). No directional edge.</td></tr>
+  <tr><td><strong>R:R</strong></td><td>Risk to reward. 1:5 means risking 10 pips to make 50.</td></tr>
+  <tr><td><strong>Stop loss (SL)</strong></td><td>Automatic exit if price moves against the position</td></tr>
+  <tr><td><strong>Take profit (TP)</strong></td><td>Automatic exit at the target</td></tr>
+  <tr><td><strong>Consistency</strong></td><td>Percentage of past occurrences where price moved the same way</td></tr>
+  <tr><td><strong>Post-entry move</strong></td><td>Movement from minute 5 to minute 30. The only part that is capturable.</td></tr>
+  <tr><td><strong>Heat / max adverse</strong></td><td>Largest move against the position before it worked out</td></tr>
+  <tr><td><strong>Co-released</strong></td><td>Two tracked events sharing a timestamp</td></tr>
+  <tr><td><strong>value_type</strong></td><td>Tag on each NEWS_MAP entry declaring whether numbers are percent, count_large or count_signed. Drives the beat/miss method.</td></tr>
+  <tr><td><strong>classification_method</strong></td><td>Column on news_events: "proportional" or "absolute". Records which rule was applied to each row.</td></tr>
+  <tr><td><strong>Expectancy</strong></td><td>Expected R per trade: (win rate × avg win R) − (loss rate × 1)</td></tr>
+  <tr><td><strong>Drawdown</strong></td><td>Fall from peak account balance</td></tr>
+  <tr><td><strong>AOI</strong></td><td>Area of interest. A price zone from the wider swing-trading method.</td></tr>
+</table>
+
+<div style="margin-top:48px;padding-top:16px;border-top:1px solid var(--border);color:var(--text2);font-size:13px;font-style:italic">
+  The value in this system is not the code. It is the loop: measure, decide, execute, record, review. The code exists to make that loop honest, because memory is not.<br><br>
+  Three months of disciplined logging will be worth more than three months of building.
+</div>
+
+</div>`;
+}
+
 // ── SETTINGS ──────────────────────────────────────────────
 async function renderSettings() {
-  const s = await GET('/settings');
+  const [s, analysisData, bfStatus] = await Promise.all([
+    GET('/settings'),
+    GET('/analysis').catch(() => ({})),
+    GET('/backfill/status').catch(() => ({missing_reactions: 0})),
+  ]);
+  const groupCount = analysisData.group_count || 0;
+  const missingReactions = bfStatus.missing_reactions || 0;
+  const riskPct = parseFloat(s.default_risk_pct || '2');
+  const dailyLimitPct = parseFloat(s.daily_loss_limit_pct || '6');
+  const consistencyWarnHtml = riskPct > dailyLimitPct
+    ? `<div class="consistency-warn">Your per-trade risk (<span class="mono">${riskPct}%</span>) is larger than your daily loss limit (<span class="mono">${dailyLimitPct}%</span>). A single losing trade would end your trading day. Set the daily limit to at least 2× your per-trade risk.</div>`
+    : '';
+
   document.getElementById('main').innerHTML = `
-    <div class="page-header"><div class="page-title">Settings</div><div class="page-sub">OANDA API connection and data management</div></div>
+    <div class="page-header"><div class="page-title">Settings</div><div class="page-sub">OANDA API connection, risk management, and data</div></div>
     <div class="two-col">
       <div>
         <div class="card" style="margin-bottom:20px">
@@ -1757,17 +3242,59 @@ async function renderSettings() {
           </div>
           <div id="conn-res" style="margin-top:12px;font-size:12px"></div>
         </div>
-        <div class="card">
+
+        <div class="card" style="margin-bottom:20px">
+          <div class="settings-section-title">Risk Management</div>
+          ${consistencyWarnHtml}
+          <div class="form-grid" style="margin-bottom:12px">
+            <div class="form-group"><label>Starting Balance (${s.account_currency||'GBP'})</label>
+              <input type="number" id="risk-balance" value="${s.starting_balance||'5000'}"></div>
+            <div class="form-group"><label>Account Currency</label>
+              <select id="risk-currency">
+                <option value="GBP" ${(s.account_currency||'GBP')==='GBP'?'selected':''}>GBP</option>
+                <option value="USD" ${s.account_currency==='USD'?'selected':''}>USD</option>
+                <option value="EUR" ${s.account_currency==='EUR'?'selected':''}>EUR</option>
+              </select></div>
+            <div class="form-group"><label>Default Risk % per trade</label>
+              <input type="number" id="risk-pct" value="${s.default_risk_pct||'2'}" step="0.5" min="0.1"></div>
+            <div class="form-group"><label>Daily Loss Limit %</label>
+              <input type="number" id="risk-daily" value="${s.daily_loss_limit_pct||'6'}" step="0.5" min="1"></div>
+            <div class="form-group"><label>Max Trades per Day</label>
+              <input type="number" id="risk-maxtrades" value="${s.max_trades_per_day||'3'}" min="1" max="10"></div>
+          </div>
+          <button class="btn btn-primary" onclick="saveRiskSettings()">Save Risk Settings</button>
+          <div id="risk-res" style="margin-top:10px;font-size:12px"></div>
+        </div>
+
+        <div class="card" style="margin-bottom:20px">
           <div class="settings-section-title">Data Management</div>
-          <div style="font-size:13px;color:var(--text2);margin-bottom:12px;line-height:1.6">
-            All data stored in Supabase Postgres (cloud database).
+          <div style="font-size:12px;color:var(--amber);margin-bottom:12px;line-height:1.6">
+            Historical data goes back to Jan 2015. First sync pulls from Jan 2025. To pull full history, click <strong>Full Resync</strong> (2-3 hours — run overnight).
           </div>
-          <div style="font-size:12px;color:var(--amber);margin-bottom:16px;line-height:1.6">
-            Historical data goes back to Jan 2020. First sync only pulls from Jan 2025. To pull full history, click <strong>Full Resync</strong>.
-          </div>
-          <div style="display:flex;flex-wrap:gap:10px;margin-bottom:16px">
-            <button class="btn btn-blue" onclick="startFullSync()">Full Resync (Jan 2020)</button>
+          <div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:16px">
+            <button class="btn btn-blue" onclick="startSync()">⟳ Sync Now</button>
+            <button class="btn btn-blue" onclick="startFullSync()">Full Resync (Jan 2015)</button>
             <button class="btn btn-danger" onclick="clearTrades()">Clear All Trade Data</button>
+          </div>
+          <div style="font-size:12px;color:var(--text2);line-height:1.8">
+            Co-occurrence groups: <span class="mono">${groupCount}</span> group${groupCount !== 1 ? 's' : ''} built.${groupCount === 0 ? ' Run a sync if this is 0.' : ''}<br>
+            Missing price reactions: <span class="mono" style="color:${missingReactions>0?'var(--amber)':'var(--green)'}">${missingReactions}</span>
+            ${missingReactions > 0 ? `<button class="btn btn-secondary" style="margin-left:10px;padding:4px 12px;font-size:11px" onclick="triggerBackfill()">Backfill Now</button>` : ''}
+            <div id="backfill-res" style="font-size:11px;color:var(--text2);margin-top:6px"></div>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="settings-section-title">Match Audit
+            <button class="btn btn-secondary" style="margin-left:10px;padding:4px 10px;font-size:11px" onclick="loadMatchAudit()">Load</button>
+          </div>
+          <div style="font-size:12px;color:var(--text2);margin-bottom:10px;line-height:1.6">
+            Shows distinct Forex Factory titles stored under each watchlist event name. Amber = multiple FF titles matched — may indicate a false positive from old matching rules.
+          </div>
+          <div id="match-audit-body" style="font-size:11px"></div>
+          <div style="margin-top:12px" id="reclassify-section" style="display:none">
+            <button class="btn btn-danger" onclick="checkReclassify()">Re-check Event Matching</button>
+            <div id="reclassify-res" style="font-size:12px;margin-top:8px"></div>
           </div>
         </div>
       </div>
@@ -1789,9 +3316,95 @@ async function renderSettings() {
           <div>📈 <strong>Price data:</strong> OANDA v20 REST API</div>
           <div>🗃️ <strong>Storage:</strong> Supabase (Postgres)</div>
           <div>🔄 <strong>Auto-sync:</strong> Daily when app is running</div>
+          <div>🔁 <strong>Full history:</strong> Jan 2015 — run overnight</div>
         </div>
       </div>
     </div>`;
+}
+
+async function saveRiskSettings() {
+  const res = document.getElementById('risk-res');
+  try {
+    await POST('/settings/risk', {
+      starting_balance: document.getElementById('risk-balance')?.value || '5000',
+      account_currency: document.getElementById('risk-currency')?.value || 'GBP',
+      default_risk_pct: document.getElementById('risk-pct')?.value || '2',
+      daily_loss_limit_pct: document.getElementById('risk-daily')?.value || '6',
+      max_trades_per_day: document.getElementById('risk-maxtrades')?.value || '3',
+    });
+    if (res) res.innerHTML = '<span style="color:var(--green)">✓ Risk settings saved</span>';
+    toast('Risk settings saved', 'success');
+  } catch(e) {
+    if (res) res.innerHTML = `<span style="color:var(--red)">✗ ${e.message}</span>`;
+  }
+}
+
+async function triggerBackfill() {
+  const res = document.getElementById('backfill-res');
+  if (res) res.textContent = 'Backfilling...';
+  try {
+    await POST('/backfill', {});
+    if (res) res.innerHTML = '<span style="color:var(--green)">✓ Backfill started in background</span>';
+    toast('Backfill started', 'success');
+  } catch(e) {
+    if (res) res.innerHTML = `<span style="color:var(--red)">✗ ${e.message}</span>`;
+  }
+}
+
+async function loadMatchAudit() {
+  const el = document.getElementById('match-audit-body');
+  const rsec = document.getElementById('reclassify-section');
+  if (!el) return;
+  el.textContent = 'Loading...';
+  try {
+    const data = await GET('/audit/matches');
+    const events = data.events || [];
+    el.innerHTML = `<table style="width:100%;font-size:11px;border-collapse:collapse">
+      <tr><th style="text-align:left;padding:4px 8px;border-bottom:1px solid var(--border)">Event</th>
+          <th style="text-align:left;padding:4px 8px;border-bottom:1px solid var(--border)">FF Titles seen</th></tr>
+      ${events.map(ev => {
+        const flagColor = ev.multi_title ? 'color:var(--amber)' : '';
+        return `<tr style="${flagColor}">
+          <td style="padding:4px 8px;border-bottom:1px solid var(--border);white-space:nowrap">${ev.your_name.replace(/ US$| UK$/,'')}</td>
+          <td style="padding:4px 8px;border-bottom:1px solid var(--border)">${ev.titles.map(t=>`<span class="news-tag">${t.ff_title} (${t.count})</span>`).join(' ')}</td>
+        </tr>`;
+      }).join('')}
+    </table>`;
+    if (rsec) rsec.style.display = 'block';
+  } catch(e) {
+    el.innerHTML = `<span style="color:var(--red)">${e.message}</span>`;
+  }
+}
+
+async function checkReclassify() {
+  const res = document.getElementById('reclassify-res');
+  if (!res) return;
+  res.textContent = 'Checking...';
+  try {
+    const data = await fetch(`${API}/admin/reclassify?confirm=false`, {method:'POST'}).then(r=>r.json());
+    if (data.to_delete === 0) {
+      res.innerHTML = '<span style="color:var(--green)">✓ All events match correctly — nothing to remove.</span>';
+      return;
+    }
+    const names = (data.preview||[]).slice(0,10).map(e=>`${e.your_name}: "${e.ff_title}"`).join('<br>');
+    res.innerHTML = `<span style="color:var(--amber)">⚠ ${data.to_delete} rows no longer match current rules:</span><br>
+      <div style="margin:8px 0;font-size:10px;color:var(--text3)">${names}${data.to_delete>10?'<br>...and more':''}</div>
+      <button class="btn btn-danger" onclick="doReclassify(${data.to_delete})">Remove these ${data.to_delete} rows</button>`;
+  } catch(e) {
+    res.innerHTML = `<span style="color:var(--red)">${e.message}</span>`;
+  }
+}
+
+async function doReclassify(count) {
+  if (!confirm(`This will permanently delete ${count} mismatched event rows and their price reactions. Continue?`)) return;
+  const res = document.getElementById('reclassify-res');
+  try {
+    const data = await fetch(`${API}/admin/reclassify?confirm=true`, {method:'POST'}).then(r=>r.json());
+    if (res) res.innerHTML = `<span style="color:var(--green)">✓ ${data.message}</span>`;
+    toast(data.message, 'success');
+  } catch(e) {
+    if (res) res.innerHTML = `<span style="color:var(--red)">${e.message}</span>`;
+  }
 }
 
 async function saveSettings() {
