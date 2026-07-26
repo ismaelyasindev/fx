@@ -5,7 +5,7 @@ Then open: http://localhost:8000
 """
 
 from fastapi import FastAPI, HTTPException, Request, Query
-from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse, RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional
@@ -1189,25 +1189,23 @@ async def trigger_backfill():
     asyncio.create_task(do_backfill())
     return {"message": "Backfill started"}
 
-@app.get("/", response_class=HTMLResponse)
+@app.get("/")
 async def serve_frontend():
-    # On Vercel, `public/` is often CDN-only and missing from the function
-    # bundle unless includeFiles pulls it in — search several locations.
-    bases = [Path(__file__).resolve().parent, Path.cwd()]
-    candidates = []
-    for base in bases:
-        candidates.append(base / "public" / "index.html")
-        candidates.append(base / "index.html")
-    for path in candidates:
+    # Vercel extracts public/ to the CDN as /index.html and does not keep it
+    # on the function disk. Redirect there instead of reading a file (avoids
+    # the fragile root-index.html duplicate the old deploy relied on).
+    if os.getenv("VERCEL"):
+        return RedirectResponse(url="/index.html", status_code=307)
+    for path in (
+        Path(__file__).resolve().parent / "public" / "index.html",
+        Path.cwd() / "public" / "index.html",
+    ):
         try:
             if path.is_file():
                 return HTMLResponse(content=path.read_text(encoding="utf-8"))
         except Exception:
             continue
-    raise HTTPException(
-        status_code=404,
-        detail="index.html not found",
-    )
+    raise HTTPException(status_code=404, detail="index.html not found")
 
 @app.on_event("startup")
 async def on_startup():
