@@ -60,7 +60,8 @@ NEWS_MAP = [
     ("Core Inflation MoM US",            "Core CPI",                         "USD",    "red",      ["PPI"],                                                                           "percent"),
     ("Inflation Rate YoY US",            "CPI y/y",                          "USD",    "red",      ["Core", "PPI"],                                                                   "percent"),
     ("Inflation Rate YoY UK",            "CPI y/y",                          "GBP",    "orange",   ["Core", "PPI"],                                                                   "percent"),
-    ("FOMC US",                          "FOMC",                              "USD",    "orange",   ["Member"],                                                                        "percent"),
+    ("FOMC Statement US",                "FOMC Statement",                   "USD",    "red",      ["Minutes"],                                                                       "percent"),
+    ("FOMC Press Conference US",         "FOMC Press Conference",            "USD",    "red",      ["Minutes"],                                                                       "percent"),
     ("Building Permits US",              "Building Permits",                  "USD",    "orange",   [],                                                                                "count_large"),
     ("Housing Starts US",                "Housing Starts",                    "USD",    "orange",   [],                                                                                "count_large"),
     ("S&P Global Manufacturing PMI UK",  "Manufacturing PMI",                 "GBP",    "orange",   [],                                                                                "percent"),
@@ -115,12 +116,36 @@ def ensure_tables():
             "ALTER TABLE price_reactions ADD COLUMN IF NOT EXISTS max_adverse_5_30 REAL",
             "ALTER TABLE price_reactions ADD COLUMN IF NOT EXISTS is_co_released BOOLEAN DEFAULT FALSE",
             "ALTER TABLE news_events ADD COLUMN IF NOT EXISTS classification_method TEXT",
+            # Canonical UTC instant for this event occurrence, computed via
+            # parse_event_datetime(event_date, event_time, country). Uniqueness is
+            # keyed on this instead of the raw (event_date, event_time) text pair —
+            # a formatted local-time string is fragile to key on (it depends on
+            # exact formatting matching across scrapes); a timestamp is not.
+            "ALTER TABLE news_events ADD COLUMN IF NOT EXISTS event_datetime_utc TIMESTAMPTZ",
         ]
         for sql in new_pr_cols:
             try:
                 conn.execute(sql)
             except Exception as e:
                 print(f"  Column migration skipped: {e}")
+        # Ensure the timestamp-keyed uniqueness constraint exists, then retire the
+        # old text-keyed one — both active at once is unsafe (an insert the new key
+        # would correctly merge could still hard-fail against the old one, since
+        # ON CONFLICT only suppresses the constraint it names).
+        try:
+            conn.execute("""
+                CREATE UNIQUE INDEX IF NOT EXISTS news_events_your_name_event_datetime_utc_key
+                ON news_events (your_name, event_datetime_utc)
+            """)
+        except Exception as e:
+            print(f"  event_datetime_utc unique index skipped: {e}")
+        try:
+            conn.execute("""
+                ALTER TABLE news_events
+                DROP CONSTRAINT IF EXISTS news_events_your_name_event_date_event_time_key
+            """)
+        except Exception as e:
+            print(f"  old constraint drop skipped: {e}")
         conn.commit()
         conn.close()
     except Exception as e:
@@ -296,6 +321,55 @@ def get_group_analysis(group_key: str) -> dict:
 def build_ff_url(year: int, month: int) -> str:
     dt = datetime(year, month, 1)
     return f"https://www.forexfactory.com/calendar?month={dt.strftime('%b').lower()}.{year}"
+
+_CLOCK_TIME_RE = re.compile(r"^\d{1,2}:\d{2}(am|pm)$", re.IGNORECASE)
+
+
+def _extract_ff_timezone(html: str) -> str:
+    """Timezone Forex Factory rendered this scrape session in, e.g. 'Europe/London'.
+
+    FF infers this from the requester's IP and embeds it as window.FF.timezone_name
+    on every page — it is not fixed, and varies scrape to scrape depending on where
+    the request came from. Falls back to America/New_York (FF's own apparent
+    default) if the marker isn't found.
+    """
+    m = re.search(r"timezone_name:\s*'([^']+)'", html)
+    return m.group(1) if m else "America/New_York"
+
+
+def canonicalize_event_time(raw_time: str, event_date: str, ff_tz_name: str, country: str) -> str:
+    """Re-express FF's raw displayed time as the event's own country's conventional
+    local time — a stable string independent of which timezone FF happened to
+    render this particular scrape session in.
+
+    Without this, the same real release can be stored under a different raw
+    event_time on every sync (see _extract_ff_timezone), which defeats the
+    (your_name, event_date, event_time) uniqueness constraint in news_events and
+    creates duplicate rows for one real occurrence. Non-clock-format strings
+    (revision-row labels like "Oct Data") are returned unchanged — those are
+    filtered out by the caller before this is ever invoked.
+    """
+    if not raw_time or raw_time in ("", "Tentative", "All Day"):
+        return raw_time or ""
+    try:
+        naive = datetime.strptime(raw_time, "%I:%M%p")
+    except ValueError:
+        return raw_time
+    try:
+        from zoneinfo import ZoneInfo
+        ev_date = datetime.strptime(event_date, "%Y-%m-%d")
+        ff_tz = ZoneInfo(ff_tz_name)
+        local_in_ff_tz = datetime(
+            ev_date.year, ev_date.month, ev_date.day, naive.hour, naive.minute, tzinfo=ff_tz
+        )
+        utc_dt = local_in_ff_tz.astimezone(ZoneInfo("UTC"))
+        target_tz = ZoneInfo("Europe/London") if country == "GBP" else ZoneInfo("America/New_York")
+        canon_dt = utc_dt.astimezone(target_tz)
+        h12 = canon_dt.hour % 12 or 12
+        period = "am" if canon_dt.hour < 12 else "pm"
+        return f"{h12}:{canon_dt.minute:02d}{period}"
+    except Exception:
+        return raw_time
 
 def parse_impact(td) -> str:
     """Extract impact colour from FF impact cell."""
@@ -484,6 +558,8 @@ async def scrape_month(year: int, month: int, client: httpx.AsyncClient, watchli
         if not html:
             return []
 
+        ff_timezone = _extract_ff_timezone(html)
+
         soup = BeautifulSoup(html, "html.parser")
         table = soup.find("table", class_=re.compile(r"calendar"))
         if not table:
@@ -500,6 +576,8 @@ async def scrape_month(year: int, month: int, client: httpx.AsyncClient, watchli
             cells = row.find_all("td")
             if not cells:
                 continue
+
+            is_revision_row = False
 
             # Date cell
             date_cell = row.find("td", class_=re.compile(r"date|calendar__date"))
@@ -531,7 +609,14 @@ async def scrape_month(year: int, month: int, client: httpx.AsyncClient, watchli
             if time_cell:
                 t = time_cell.get_text(strip=True)
                 if t and t not in ("", "All Day", "Tentative"):
-                    current_time = t
+                    if _CLOCK_TIME_RE.match(t):
+                        current_time = t
+                    else:
+                        # Not a real clock time (e.g. a prior-period revision
+                        # addendum row like "Oct Data") — don't let it clobber
+                        # current_time, and don't treat this row as a distinct
+                        # occurrence at all (see is_revision_row below).
+                        is_revision_row = True
 
             # Currency cell
             currency_cell = row.find("td", class_=re.compile(r"currency|calendar__currency"))
@@ -570,18 +655,24 @@ async def scrape_month(year: int, month: int, client: httpx.AsyncClient, watchli
             if not current_date:
                 continue
 
+            # Revision-row addendum (e.g. "Oct Data") is not a distinct occurrence
+            # of this event — skip it rather than storing a garbage event_time.
+            if is_revision_row:
+                continue
+
             your_name_for_threshold = match["your_name"] if match else None
             threshold = (_scrape_thresholds.get(your_name_for_threshold, 1.0)
                          if your_name_for_threshold else 1.0)
             vtype = match["value_type"] if match else "percent"
             beat_miss, cls_method = classify_beat_miss(actual, forecast, threshold, vtype)
+            ev_country = match["country"] if match else currency
 
             events.append({
                 "your_name": your_name_for_threshold,
                 "ff_title": ff_title,
-                "country": match["country"] if match else currency,
+                "country": ev_country,
                 "event_date": current_date,
-                "event_time": current_time or "",
+                "event_time": canonicalize_event_time(current_time, current_date, ff_timezone, ev_country),
                 "previous": previous,
                 "forecast": forecast,
                 "actual": actual,
@@ -604,26 +695,35 @@ def get_oanda_config() -> dict:
     cfg = {r["key"]: r["value"] for r in rows}
     return cfg
 
-def parse_event_datetime(event_date: str, event_time: str) -> datetime | None:
-    """Convert event date + time string to UTC datetime."""
+def parse_event_datetime(event_date: str, event_time: str, country: str = "USD") -> datetime | None:
+    """Convert event date + time string to UTC datetime.
+
+    event_time is treated as local clock time in the event's own country
+    (Europe/London for GBP, America/New_York for USD) and converted to UTC
+    with proper DST awareness via zoneinfo — mirrors format_release_times(),
+    which already did this correctly for display purposes but was never
+    wired into the OANDA-fetch path this function feeds. Previously this
+    function labelled the raw local string as UTC with no conversion at all,
+    which mis-anchored every OANDA candle window fetched through it.
+    """
+    from zoneinfo import ZoneInfo
+    tz = ZoneInfo("Europe/London") if country == "GBP" else ZoneInfo("America/New_York")
     try:
         if not event_time or event_time in ("", "Tentative", "All Day"):
-            # Default to 13:30 UTC (typical US news time)
-            dt_str = f"{event_date} 13:30"
-        else:
-            # FF times are in US Eastern — convert to UTC (ET + 5h in winter, +4h in summer)
-            # Use approximate: most major news is 8:30am ET = 13:30 UTC
-            # We'll store the raw time and let OANDA window handle it
-            dt_str = f"{event_date} {event_time}"
+            # Default to 8:30am local (typical major US release time) when FF gives no time
+            local_dt = datetime.strptime(f"{event_date} 08:30", "%Y-%m-%d %H:%M").replace(tzinfo=tz)
+            return local_dt.astimezone(timezone.utc)
 
         # Try parsing various formats
         for fmt in ["%Y-%m-%d %I:%M%p", "%Y-%m-%d %H:%M", "%Y-%m-%d %I:%M %p"]:
             try:
-                return datetime.strptime(dt_str, fmt).replace(tzinfo=timezone.utc)
+                local_dt = datetime.strptime(f"{event_date} {event_time}", fmt).replace(tzinfo=tz)
+                return local_dt.astimezone(timezone.utc)
             except:
                 continue
-        # Fallback: just use date at 13:30 UTC
-        return datetime.strptime(f"{event_date} 13:30", "%Y-%m-%d %H:%M").replace(tzinfo=timezone.utc)
+        # Fallback: 8:30am local on the given date
+        local_dt = datetime.strptime(f"{event_date} 08:30", "%Y-%m-%d %H:%M").replace(tzinfo=tz)
+        return local_dt.astimezone(timezone.utc)
     except:
         return None
 
@@ -635,7 +735,7 @@ async def fetch_price_reaction(event: dict, client: httpx.AsyncClient, cfg: dict
         return None
 
     base_url = "https://api-fxtrade.oanda.com" if env == "live" else "https://api-fxpractice.oanda.com"
-    event_dt = parse_event_datetime(event["event_date"], event["event_time"])
+    event_dt = parse_event_datetime(event["event_date"], event["event_time"], event.get("country", "USD"))
     if not event_dt:
         return None
 
@@ -760,35 +860,44 @@ async def fetch_price_reaction(event: dict, client: httpx.AsyncClient, cfg: dict
 
 # ── SAVE TO DB ────────────────────────────────────────────
 def save_events(events: list) -> tuple[int, int]:
-    """Save news events to DB. Returns (total, new)."""
+    """Save news events to DB. Returns (total, new).
+
+    Identity for ON CONFLICT is (your_name, event_datetime_utc) — a real
+    timestamp computed via parse_event_datetime(), not the raw (event_date,
+    event_time) text pair. Keying on a formatted string is fragile to exact
+    formatting matching across scrapes; a timestamp is not.
+    """
     conn = get_db()
     c = conn.cursor()
     new_count = 0
     for ev in events:
         try:
             cls_method = ev.get("classification_method", "proportional")
+            dt_utc = parse_event_datetime(ev["event_date"], ev["event_time"], ev["country"])
             c.execute("""
                 INSERT INTO news_events
-                (your_name, ff_title, country, event_date, event_time, previous, forecast, actual, impact, beat_miss, classification_method)
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                ON CONFLICT (your_name, event_date, event_time) DO UPDATE SET
+                (your_name, ff_title, country, event_date, event_time, previous, forecast, actual, impact, beat_miss, classification_method, event_datetime_utc)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                ON CONFLICT (your_name, event_datetime_utc) DO UPDATE SET
                     ff_title = EXCLUDED.ff_title,
+                    event_date = EXCLUDED.event_date,
+                    event_time = EXCLUDED.event_time,
                     previous = EXCLUDED.previous,
                     forecast = EXCLUDED.forecast,
                     impact = EXCLUDED.impact
                 WHERE news_events.actual = '' OR news_events.actual IS NULL
             """, (ev["your_name"], ev["ff_title"], ev["country"], ev["event_date"],
                   ev["event_time"], ev["previous"], ev["forecast"], ev["actual"],
-                  ev["impact"], ev["beat_miss"], cls_method))
+                  ev["impact"], ev["beat_miss"], cls_method, dt_utc))
             if c.rowcount > 0:
                 new_count += 1
             else:
                 c.execute("""
                     UPDATE news_events SET actual=%s, beat_miss=%s, classification_method=%s
-                    WHERE your_name=%s AND event_date=%s AND event_time=%s
+                    WHERE your_name=%s AND event_datetime_utc=%s
                     AND (actual='' OR actual IS NULL)
                 """, (ev["actual"], ev["beat_miss"], cls_method,
-                      ev["your_name"], ev["event_date"], ev["event_time"]))
+                      ev["your_name"], dt_utc))
         except Exception as e:
             print(f"  DB error saving event: {e}")
     conn.commit()

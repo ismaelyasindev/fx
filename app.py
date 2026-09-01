@@ -77,7 +77,8 @@ def init_db():
             ("Core Inflation MoM US",            "Good",      ""),
             ("Inflation Rate YoY US",            "Caution",   "Check Forecast vs Actual before trade"),
             ("Inflation Rate YoY UK",            "Caution",   "Not good with US news - fluctuate a lot"),
-            ("FOMC US",                          "Caution",   "Not sure - check alone"),
+            ("FOMC Statement US",                "Caution",   "Split from merged FOMC US Aug 2026 - initial reaction to the rate decision text, often fast. No independent history yet."),
+            ("FOMC Press Conference US",         "Caution",   "Split from merged FOMC US Aug 2026 - Powell's Q&A tone can reverse the Statement's initial move. No independent history yet."),
             ("Building Permits US",              "Caution",   "Not sure - check alone"),
             ("Housing Starts US",                "Caution",   "Not sure - check alone"),
             ("S&P Global Manufacturing PMI UK",  "Caution",   "Not sure - check alone"),
@@ -105,6 +106,17 @@ def init_db():
     c.execute(
         "INSERT INTO news_ratings (name, type, comment) VALUES (%s, %s, %s) ON CONFLICT (name) DO NOTHING",
         ("Average Earnings UK", "Caution", "New to watchlist July 2026 - no personal history yet"),
+    )
+    # FOMC US split into FOMC Statement US / FOMC Press Conference US Aug 2026 (was
+    # matching both "FOMC Statement" and "FOMC Press Conference" FF titles under one
+    # name). Old "FOMC US" news_ratings row is left in place, not deleted, since
+    # Meeting Minutes rows still carry that your_name and it's otherwise harmless.
+    c.executemany(
+        "INSERT INTO news_ratings (name, type, comment) VALUES (%s, %s, %s) ON CONFLICT (name) DO NOTHING",
+        [
+            ("FOMC Statement US", "Caution", "Split from merged FOMC US Aug 2026 - initial reaction to the rate decision text, often fast. No independent history yet."),
+            ("FOMC Press Conference US", "Caution", "Split from merged FOMC US Aug 2026 - Powell's Q&A tone can reverse the Statement's initial move. No independent history yet."),
+        ],
     )
 
     # Section 1: risk management settings defaults
