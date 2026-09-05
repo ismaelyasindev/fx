@@ -276,6 +276,32 @@ def ensure_tables():
                 actual_exit_at TIMESTAMPTZ,
                 recorded_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             )""",
+            # environment isolation: test data must never silently enter research
+            "ALTER TABLE decision_contexts ADD COLUMN IF NOT EXISTS environment TEXT NOT NULL DEFAULT 'production'",
+            "ALTER TABLE signals ADD COLUMN IF NOT EXISTS environment TEXT NOT NULL DEFAULT 'production'",
+            "ALTER TABLE signal_corrections ADD COLUMN IF NOT EXISTS environment TEXT NOT NULL DEFAULT 'production'",
+            "ALTER TABLE signal_outcomes ADD COLUMN IF NOT EXISTS environment TEXT NOT NULL DEFAULT 'production'",
+            "ALTER TABLE executions ADD COLUMN IF NOT EXISTS environment TEXT NOT NULL DEFAULT 'production'",
+            # app build identity, kept SEPARATE from strategy_baseline
+            "ALTER TABLE decision_contexts ADD COLUMN IF NOT EXISTS app_build TEXT",
+            "ALTER TABLE signals ADD COLUMN IF NOT EXISTS app_build TEXT",
+            # which clock an outcome horizon is measured from — never conflate
+            "ALTER TABLE signal_outcomes ADD COLUMN IF NOT EXISTS clock TEXT NOT NULL DEFAULT 'DECISION'",
+            "ALTER TABLE signal_outcomes ADD COLUMN IF NOT EXISTS reference_at TIMESTAMPTZ",
+            "ALTER TABLE signal_outcomes ADD COLUMN IF NOT EXISTS time_to_tp_seconds INTEGER",
+            "ALTER TABLE signal_outcomes ADD COLUMN IF NOT EXISTS time_to_sl_seconds INTEGER",
+            "ALTER TABLE signal_outcomes ADD COLUMN IF NOT EXISTS hypothetical_r REAL",
+            "ALTER TABLE signal_outcomes ADD COLUMN IF NOT EXISTS collector_attempts INTEGER DEFAULT 0",
+            "ALTER TABLE decision_contexts ADD COLUMN IF NOT EXISTS release_at_resolved TIMESTAMPTZ",
+            # release_at on signals so the collector can work off either clock
+            "ALTER TABLE signals ADD COLUMN IF NOT EXISTS release_at TIMESTAMPTZ",
+            # widen outcome uniqueness to include the clock
+            """DO $$ BEGIN
+                 ALTER TABLE signal_outcomes DROP CONSTRAINT IF EXISTS signal_outcomes_opportunity_id_horizon_decision_id_key;
+               EXCEPTION WHEN others THEN NULL; END $$""",
+            """CREATE UNIQUE INDEX IF NOT EXISTS uq_outcome_key
+               ON signal_outcomes (opportunity_id, decision_id, horizon, clock)""",
+            "CREATE INDEX IF NOT EXISTS idx_signals_env ON signals (environment)",
             "CREATE INDEX IF NOT EXISTS idx_signals_opportunity ON signals (opportunity_id)",
             "CREATE INDEX IF NOT EXISTS idx_signals_context ON signals (context_id)",
             "CREATE INDEX IF NOT EXISTS idx_outcomes_opportunity ON signal_outcomes (opportunity_id)",
@@ -1233,6 +1259,174 @@ def audit_reclassify() -> list:
         if not new_match or new_match["your_name"] != d["your_name"]:
             to_delete.append({"id": d["id"], "your_name": d["your_name"], "ff_title": d["ff_title"]})
     return to_delete
+
+# ── AUTOMATIC OUTCOME COLLECTOR ───────────────────────────
+# Durable, server-side, browser-independent. Pending work is DERIVED FROM THE
+# DATABASE on every pass rather than held in memory, so an application or worker
+# restart loses nothing: the next pass simply re-derives whatever is still
+# missing. Idempotent via the unique index (opportunity_id, decision_id,
+# horizon, clock) + ON CONFLICT DO NOTHING, so retries never duplicate.
+# Transient OANDA/DB failures leave the row simply not-yet-written; it is retried
+# on the next pass indefinitely.
+
+OUTCOME_HORIZONS = [("1m", 60), ("5m", 300), ("15m", 900), ("30m", 1800),
+                    ("60m", 3600), ("2h", 7200), ("3h", 10800), ("6h", 21600),
+                    ("24h", 86400)]
+
+
+async def _fetch_window(client, cfg, start_dt, end_dt, granularity="M1"):
+    token = cfg.get("token", "")
+    if not token:
+        return []
+    base = ("https://api-fxtrade.oanda.com" if cfg.get("env") == "live"
+            else "https://api-fxpractice.oanda.com")
+    try:
+        r = await client.get(
+            f"{base}/v3/instruments/GBP_USD/candles",
+            params={"from": start_dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "to": end_dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "granularity": granularity, "price": "BA"},
+            headers={"Authorization": f"Bearer {token}"}, timeout=30)
+        if not r.is_success:
+            return []
+        return [c for c in r.json().get("candles", []) if c.get("complete", True)]
+    except Exception:
+        return []
+
+
+async def collect_pending_outcomes(max_rows: int = 40) -> int:
+    """One pass. Returns rows written. Safe to call repeatedly and concurrently-ish."""
+    from datetime import datetime, timezone, timedelta
+    written = 0
+    try:
+        cfg = get_oanda_config()
+        if not cfg.get("token"):
+            return 0
+        conn = get_db()
+        try:
+            sigs = [dict(r) for r in conn.execute("""
+                SELECT s.decision_id, s.opportunity_id, s.environment, s.direction,
+                       s.client_decision_at, s.proposed_entry, s.proposed_sl, s.proposed_tp,
+                       COALESCE(s.release_at, dc.release_at_resolved) AS release_at
+                FROM signals s
+                LEFT JOIN decision_contexts dc ON dc.context_id = s.context_id
+                ORDER BY s.server_received_at DESC LIMIT 400
+            """).fetchall()]
+            done = set()
+            for r in conn.execute("""SELECT opportunity_id, decision_id, horizon, clock
+                                     FROM signal_outcomes""").fetchall():
+                d = dict(r)
+                done.add((d["opportunity_id"], d["decision_id"], d["horizon"], d["clock"]))
+        finally:
+            conn.close()
+
+        now = datetime.now(timezone.utc)
+        todo = []
+        for s in sigs:
+            clocks = [("DECISION", s.get("client_decision_at"))]
+            if s.get("release_at"):
+                clocks.append(("RELEASE", s.get("release_at")))
+            for clock, ref in clocks:
+                if not ref:
+                    continue
+                if isinstance(ref, str):
+                    try:
+                        ref = datetime.fromisoformat(ref.replace("Z", "+00:00"))
+                    except Exception:
+                        continue
+                if ref.tzinfo is None:
+                    ref = ref.replace(tzinfo=timezone.utc)
+                for hz, secs in OUTCOME_HORIZONS:
+                    if (s["opportunity_id"], s["decision_id"], hz, clock) in done:
+                        continue
+                    if now < ref + timedelta(seconds=secs):
+                        continue                      # horizon has not arrived yet
+                    todo.append((s, clock, ref, hz, secs))
+        if not todo:
+            return 0
+        todo = todo[:max_rows]
+
+        async with httpx.AsyncClient() as client:
+            for s, clock, ref, hz, secs in todo:
+                candles = await _fetch_window(client, cfg, ref - timedelta(minutes=1),
+                                              ref + timedelta(seconds=secs) + timedelta(minutes=1))
+                if not candles:
+                    continue                          # transient failure -> retried next pass
+                def mid(c, side="c"):
+                    return (float(c["bid"][side]) + float(c["ask"][side])) / 2
+                entry_mid = mid(candles[0], "o")
+                target_t = ref + timedelta(seconds=secs)
+                end_px = None
+                for c in candles:
+                    ct = datetime.strptime(c["time"][:19], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc)
+                    if ct >= target_t:
+                        end_px = mid(c, "o"); break
+                if end_px is None:
+                    end_px = mid(candles[-1], "c")
+                long = (s.get("direction") == "up")
+                sign = 1 if long else -1
+                pips = (end_px - entry_mid) * 10000 * sign
+                mfe = mae = 0.0
+                tp_s = sl_s = None
+                first = None
+                ep, slp, tpp = s.get("proposed_entry"), s.get("proposed_sl"), s.get("proposed_tp")
+                for c in candles:
+                    ct = datetime.strptime(c["time"][:19], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc)
+                    if ct < ref:
+                        continue
+                    hi = float(c["bid"]["h"]) if long else float(c["ask"]["h"])
+                    lo = float(c["bid"]["l"]) if long else float(c["ask"]["l"])
+                    mfe = max(mfe, ((hi - entry_mid) if long else (entry_mid - lo)) * 10000)
+                    mae = max(mae, ((entry_mid - lo) if long else (hi - entry_mid)) * 10000)
+                    if ep and slp and tpp:
+                        el = int((ct - ref).total_seconds())
+                        hit_tp = (hi >= tpp) if long else (lo <= tpp)
+                        hit_sl = (lo <= slp) if long else (hi >= slp)
+                        if hit_tp and tp_s is None:
+                            tp_s = el
+                            first = first or "TP"
+                        if hit_sl and sl_s is None:
+                            sl_s = el
+                            first = first or "SL"
+                hyp_r = None
+                if ep and slp and first:
+                    risk = abs(ep - slp) * 10000
+                    if risk > 0:
+                        hyp_r = (abs(tpp - ep) * 10000 / risk) if first == "TP" else -1.0
+                conn = get_db()
+                try:
+                    conn.execute("""
+                        INSERT INTO signal_outcomes (opportunity_id, decision_id, horizon, clock,
+                            reference_at, price, pips, mfe, mae, hypothetical_result,
+                            time_to_tp_seconds, time_to_sl_seconds, hypothetical_r, environment)
+                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                        ON CONFLICT (opportunity_id, decision_id, horizon, clock) DO NOTHING
+                    """, (s["opportunity_id"], s["decision_id"], hz, clock, ref, end_px,
+                          round(pips, 1), round(mfe, 1), round(mae, 1), first,
+                          tp_s, sl_s, hyp_r, s.get("environment") or "production"))
+                    conn.commit()
+                    written += 1
+                except Exception as e:
+                    print(f"  outcome write {s['decision_id'][:8]} {hz}/{clock}: {e}")
+                finally:
+                    conn.close()
+                await asyncio.sleep(0.25)
+    except Exception as e:
+        print(f"  collect_pending_outcomes error: {e}")
+    return written
+
+
+async def outcome_collector_loop(interval_s: int = 60):
+    """Background loop. Restart-safe: derives all pending work from the DB each pass."""
+    while True:
+        try:
+            n = await collect_pending_outcomes()
+            if n:
+                print(f"  outcome collector: wrote {n} observation(s)")
+        except Exception as e:
+            print(f"  outcome collector loop error: {e}")
+        await asyncio.sleep(interval_s)
+
 
 # ── MAIN SYNC FUNCTION ────────────────────────────────────
 async def run_sync(progress_callback=None, start_date: datetime | None = None) -> dict:

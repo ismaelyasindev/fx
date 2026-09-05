@@ -25,6 +25,7 @@ from scraper import (
     build_event_groups, get_group_analysis,
     audit_matches, audit_reclassify, backfill_missing_reactions,
     count_events_without_reactions, ensure_tables, reclassify_existing_rows,
+    outcome_collector_loop, collect_pending_outcomes,
 )
 
 # ── STRATEGY BASELINE ─────────────────────────────────────
@@ -41,6 +42,13 @@ BASELINE_REF = {
     "worktree_diff": "929284fb3a36a46c",
     "audit_doc": "research/AUDIT-2026-09-05.md",
 }
+
+# Application BUILD identity — deliberately SEPARATE from STRATEGY_BASELINE.
+# A logging/UI/infra-only change moves APP_BUILD but must NOT move the baseline.
+# Any behaviour change to classification, eligibility, direction, Stage A/C,
+# timing, SL, TP, R:R or trade/no-trade rules REQUIRES a new strategy baseline.
+APP_BUILD = "9084e2c"          # working tree verified clean at this commit
+APP_BUILD_DIRTY = False
 
 # ── APP SETUP ─────────────────────────────────────────────
 app = FastAPI(title="GBP/USD Trading Intelligence")
@@ -1226,7 +1234,8 @@ async def trigger_backfill():
     asyncio.create_task(do_backfill())
     return {"message": "Backfill started"}
 
-def _persist_decision_context(kind: str, event_key: str, payload: dict) -> str | None:
+def _persist_decision_context(kind: str, event_key: str, payload: dict,
+                              environment: str = "production") -> str | None:
     """Persist an IMMUTABLE snapshot of exactly what we are about to serve, and
     return its context_id. The client later posts its browser-derived verdict
     linked to this id, so the final record uses the information the browser
@@ -1251,13 +1260,15 @@ def _persist_decision_context(kind: str, event_key: str, payload: dict) -> str |
             conn.execute("""
                 INSERT INTO decision_contexts (context_id, baseline, kind, event_key, pair,
                     country, event_date, event_time, forecast, previous, hist_n, up_count,
-                    down_count, raw_consistency, wilson_lower, scenario_stats, server_meta)
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                    down_count, raw_consistency, wilson_lower, scenario_stats, server_meta,
+                    environment, app_build)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
             """, (ctx_id, STRATEGY_BASELINE, kind, event_key, "GBP_USD",
                   payload.get("country"), payload.get("release_date"),
                   payload.get("release_time"), str(payload.get("forecast") or ""),
                   str(payload.get("previous") or ""), hist_n, up, down, raw_c, wlb,
-                  json.dumps(payload, default=str), json.dumps(BASELINE_REF)))
+                  json.dumps(payload, default=str), json.dumps(BASELINE_REF),
+                  environment, APP_BUILD))
             conn.commit()
         finally:
             conn.close()
@@ -1292,9 +1303,12 @@ class SignalIn(BaseModel):
     ui_path: Optional[str] = None
     client_payload: Optional[dict] = None
     baseline: Optional[str] = None
+    environment: Optional[str] = None
+    release_at: Optional[str] = None
 
 
 class ExecutionIn(BaseModel):
+    environment: Optional[str] = None
     execution_id: str
     opportunity_id: str
     status: str
@@ -1339,14 +1353,22 @@ def ingest_signal(sig: SignalIn):
             e = dict(existing)
             return {"decision_id": e["decision_id"], "duplicate": True, "stored": False,
                     "server_received_at": str(e["server_received_at"])}
+        # environment is INHERITED from the linked context; a test context can
+        # never silently produce a production signal.
+        env = (sig.environment or "production")
+        if sig.context_id:
+            crow = conn.execute("SELECT environment FROM decision_contexts WHERE context_id=%s",
+                                (sig.context_id,)).fetchone()
+            if crow:
+                env = dict(crow).get("environment") or env
         c = conn.cursor()
         c.execute("""
             INSERT INTO signals (decision_id, opportunity_id, context_id, baseline, stage,
                 decision, tier, direction, reason, raw_actual, normalized_actual,
                 client_classification, scenario_key, warning_state, override_state,
                 reference_price, proposed_entry, proposed_sl, proposed_tp, ui_path,
-                client_payload, client_decision_at)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                client_payload, client_decision_at, environment, app_build, release_at)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
         """, (sig.decision_id, sig.opportunity_id, sig.context_id,
               sig.baseline or STRATEGY_BASELINE, sig.stage, sig.decision, sig.tier,
               sig.direction, sig.reason,
@@ -1359,9 +1381,10 @@ def ingest_signal(sig: SignalIn):
               sig.reference_price, sig.proposed_entry, sig.proposed_sl, sig.proposed_tp,
               sig.ui_path,
               json.dumps(sig.client_payload) if sig.client_payload is not None else None,
-              sig.client_decision_at))
+              sig.client_decision_at, env, APP_BUILD, sig.release_at))
         conn.commit()
-        return {"decision_id": sig.decision_id, "duplicate": False, "stored": True}
+        return {"decision_id": sig.decision_id, "duplicate": False, "stored": True,
+                "environment": env, "app_build": APP_BUILD}
     finally:
         conn.close()
 
@@ -1374,13 +1397,18 @@ def ingest_execution(ex: ExecutionIn):
                                 (ex.execution_id,)).fetchone()
         if existing:
             return {"execution_id": ex.execution_id, "duplicate": True, "stored": False}
+        env = (ex.environment or "production")
+        srow = conn.execute("SELECT environment FROM signals WHERE opportunity_id=%s LIMIT 1",
+                            (ex.opportunity_id,)).fetchone()
+        if srow:
+            env = dict(srow).get("environment") or env
         conn.execute("""
-            INSERT INTO executions (execution_id, opportunity_id, decision_id, status, broker,
+            INSERT INTO executions (environment, execution_id, opportunity_id, decision_id, status, broker,
                 direction, actual_fill_price, actual_sl, actual_tp, actual_rr, lot_size,
                 exit_price, realized_pips, realized_r, realized_pnl, notes,
                 execution_decision_at, actual_fill_at, actual_exit_at)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-        """, (ex.execution_id, ex.opportunity_id, ex.decision_id, ex.status, ex.broker,
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        """, (env, ex.execution_id, ex.opportunity_id, ex.decision_id, ex.status, ex.broker,
               ex.direction, ex.actual_fill_price, ex.actual_sl, ex.actual_tp, ex.actual_rr,
               ex.lot_size, ex.exit_price, ex.realized_pips, ex.realized_r, ex.realized_pnl,
               ex.notes, ex.execution_decision_at, ex.actual_fill_at, ex.actual_exit_at))
@@ -1408,16 +1436,26 @@ def ingest_correction(c: CorrectionIn):
 
 
 @app.get("/api/signals")
-def list_signals(opportunity_id: Optional[str] = Query(None), limit: int = Query(100)):
+def list_signals(opportunity_id: Optional[str] = Query(None), limit: int = Query(100),
+                 environment: str = Query("production")):
+    """Research queries default to PRODUCTION ONLY. Pass environment=test or
+    environment=all to include synthetic validation records explicitly."""
     conn = get_db()
     try:
+        env_clause = "" if environment == "all" else " AND environment = %s"
         if opportunity_id:
-            rows = conn.execute("""SELECT * FROM signals WHERE opportunity_id = %s
-                ORDER BY client_decision_at ASC""", (opportunity_id,)).fetchall()
+            params = (opportunity_id,) if environment == "all" else (opportunity_id, environment)
+            rows = conn.execute(f"""SELECT * FROM signals WHERE opportunity_id = %s{env_clause}
+                ORDER BY client_decision_at ASC""", params).fetchall()
         else:
-            rows = conn.execute("SELECT * FROM signals ORDER BY server_received_at DESC LIMIT %s",
-                                (limit,)).fetchall()
-        return {"signals": [dict(r) for r in rows], "baseline": STRATEGY_BASELINE}
+            if environment == "all":
+                rows = conn.execute("SELECT * FROM signals ORDER BY server_received_at DESC LIMIT %s",
+                                    (limit,)).fetchall()
+            else:
+                rows = conn.execute("""SELECT * FROM signals WHERE environment = %s
+                    ORDER BY server_received_at DESC LIMIT %s""", (environment, limit)).fetchall()
+        return {"signals": [dict(r) for r in rows], "baseline": STRATEGY_BASELINE,
+                "app_build": APP_BUILD, "environment_filter": environment}
     finally:
         conn.close()
 
@@ -1451,9 +1489,17 @@ def get_opportunity(opportunity_id: str):
         conn.close()
 
 
+@app.post("/api/outcomes/collect")
+async def trigger_outcome_collection():
+    n = await collect_pending_outcomes()
+    return {"written": n}
+
+
 @app.get("/api/baseline")
 def get_baseline():
-    return BASELINE_REF
+    return {**BASELINE_REF, "app_build": APP_BUILD,
+            "app_build_dirty": APP_BUILD_DIRTY,
+            "note": "strategy_baseline = frozen trading rules; app_build = code that emitted/logged it"}
 
 
 @app.get("/")
@@ -1491,6 +1537,9 @@ async def on_startup():
     except Exception as e:
         print(f"Database startup check failed: {e}")
     # Auto-backfill missing reactions in background on every startup
+    # Durable, browser-independent outcome collection.
+    asyncio.create_task(outcome_collector_loop(60))
+
     async def _startup_backfill():
         try:
             filled = await backfill_missing_reactions()
