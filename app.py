@@ -27,6 +27,21 @@ from scraper import (
     count_events_without_reactions, ensure_tables, reclassify_existing_rows,
 )
 
+# ── STRATEGY BASELINE ─────────────────────────────────────
+# Frozen, reproducible identity of the audited code state.
+# See research/AUDIT-2026-09-05.md. NEVER silently redefine this: future code
+# changes must mint a NEW baseline identifier.
+STRATEGY_BASELINE = "baseline-2026-09-05"
+BASELINE_REF = {
+    "baseline": STRATEGY_BASELINE,
+    "git_head": "d09aceea78d38abd56cf31484de1a84f1e75d183",
+    "scraper_py": "8d6fc149b09ff7062e511a38d8566a7a6b3c5671",
+    "index_html": "268eb5fdc015fb2b376e00d2c0c431a868994d94",
+    "app_py": "726fc5a0e5c1bad11a952cd07a837b4c5fc18d67",
+    "worktree_diff": "929284fb3a36a46c",
+    "audit_doc": "research/AUDIT-2026-09-05.md",
+}
+
 # ── APP SETUP ─────────────────────────────────────────────
 app = FastAPI(title="GBP/USD Trading Intelligence")
 
@@ -1033,6 +1048,10 @@ def get_group_brief(events: list[str] = Query([])):
         data = get_group_analysis(group_key)
         data["has_sufficient_data"] = data.get("total_occurrences", 0) >= 8
         data["individual_briefs"] = None
+        cid = _persist_decision_context("group", group_key, data)
+        if cid:
+            data["context_id"] = cid
+            data["baseline"] = STRATEGY_BASELINE
         return data
     except Exception as e:
         return {"error": str(e), "total_occurrences": 0, "has_sufficient_data": False, "scenarios": []}
@@ -1137,7 +1156,13 @@ async def get_upcoming(refresh: bool = Query(False)):
 @app.get("/api/brief/{event_name}")
 def get_trade_brief(event_name: str):
     try:
-        return get_brief(event_name)
+        data = get_brief(event_name)
+        if not data.get("error"):
+            cid = _persist_decision_context("single", event_name, data)
+            if cid:
+                data["context_id"] = cid
+                data["baseline"] = STRATEGY_BASELINE
+        return data
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -1200,6 +1225,236 @@ async def trigger_backfill():
 
     asyncio.create_task(do_backfill())
     return {"message": "Backfill started"}
+
+def _persist_decision_context(kind: str, event_key: str, payload: dict) -> str | None:
+    """Persist an IMMUTABLE snapshot of exactly what we are about to serve, and
+    return its context_id. The client later posts its browser-derived verdict
+    linked to this id, so the final record uses the information the browser
+    actually received — never values re-queried from a mutated database."""
+    try:
+        import uuid
+        ctx_id = "ctx_" + uuid.uuid4().hex[:20]
+        if kind == "single":
+            hist_n = (payload.get("beat_dir_n") or 0) + (payload.get("miss_dir_n") or 0)
+            up = down = None
+            raw_c = payload.get("beat_consistency")
+            wlb = payload.get("beat_wilson_lower")
+        else:
+            scen = payload.get("scenarios") or []
+            hist_n = payload.get("total_occurrences")
+            up = sum(s.get("up_count") or 0 for s in scen)
+            down = sum(s.get("down_count") or 0 for s in scen)
+            raw_c = None
+            wlb = None
+        conn = get_db()
+        try:
+            conn.execute("""
+                INSERT INTO decision_contexts (context_id, baseline, kind, event_key, pair,
+                    country, event_date, event_time, forecast, previous, hist_n, up_count,
+                    down_count, raw_consistency, wilson_lower, scenario_stats, server_meta)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            """, (ctx_id, STRATEGY_BASELINE, kind, event_key, "GBP_USD",
+                  payload.get("country"), payload.get("release_date"),
+                  payload.get("release_time"), str(payload.get("forecast") or ""),
+                  str(payload.get("previous") or ""), hist_n, up, down, raw_c, wlb,
+                  json.dumps(payload, default=str), json.dumps(BASELINE_REF)))
+            conn.commit()
+        finally:
+            conn.close()
+        return ctx_id
+    except Exception as e:
+        print(f"  decision_context persist failed: {e}")
+        return None
+
+
+# ── SIGNAL / OUTCOME / EXECUTION LOGGING ──────────────────
+# Instrumentation only. Nothing here participates in a trading decision.
+class SignalIn(BaseModel):
+    decision_id: str
+    opportunity_id: str
+    stage: str
+    decision: str
+    client_decision_at: str
+    context_id: Optional[str] = None
+    tier: Optional[str] = None
+    direction: Optional[str] = None
+    reason: Optional[str] = None
+    raw_actual: Optional[dict] = None
+    normalized_actual: Optional[dict] = None
+    client_classification: Optional[dict] = None
+    scenario_key: Optional[str] = None
+    warning_state: Optional[dict] = None
+    override_state: Optional[dict] = None
+    reference_price: Optional[float] = None
+    proposed_entry: Optional[float] = None
+    proposed_sl: Optional[float] = None
+    proposed_tp: Optional[float] = None
+    ui_path: Optional[str] = None
+    client_payload: Optional[dict] = None
+    baseline: Optional[str] = None
+
+
+class ExecutionIn(BaseModel):
+    execution_id: str
+    opportunity_id: str
+    status: str
+    decision_id: Optional[str] = None
+    broker: Optional[str] = None
+    direction: Optional[str] = None
+    actual_fill_price: Optional[float] = None
+    actual_sl: Optional[float] = None
+    actual_tp: Optional[float] = None
+    actual_rr: Optional[float] = None
+    lot_size: Optional[float] = None
+    exit_price: Optional[float] = None
+    realized_pips: Optional[float] = None
+    realized_r: Optional[float] = None
+    realized_pnl: Optional[float] = None
+    notes: Optional[str] = None
+    execution_decision_at: Optional[str] = None
+    actual_fill_at: Optional[str] = None
+    actual_exit_at: Optional[str] = None
+
+
+class CorrectionIn(BaseModel):
+    field: str
+    new_value: str
+    context_id: Optional[str] = None
+    opportunity_id: Optional[str] = None
+    old_value: Optional[str] = None
+    source: Optional[str] = None
+    note: Optional[str] = None
+
+
+@app.post("/api/signals")
+def ingest_signal(sig: SignalIn):
+    """Idempotent on decision_id. Re-POSTing the same decision_id returns the
+    EXISTING immutable row and never creates a duplicate or mutates it."""
+    conn = get_db()
+    try:
+        existing = conn.execute(
+            "SELECT decision_id, server_received_at FROM signals WHERE decision_id = %s",
+            (sig.decision_id,)).fetchone()
+        if existing:
+            e = dict(existing)
+            return {"decision_id": e["decision_id"], "duplicate": True, "stored": False,
+                    "server_received_at": str(e["server_received_at"])}
+        c = conn.cursor()
+        c.execute("""
+            INSERT INTO signals (decision_id, opportunity_id, context_id, baseline, stage,
+                decision, tier, direction, reason, raw_actual, normalized_actual,
+                client_classification, scenario_key, warning_state, override_state,
+                reference_price, proposed_entry, proposed_sl, proposed_tp, ui_path,
+                client_payload, client_decision_at)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        """, (sig.decision_id, sig.opportunity_id, sig.context_id,
+              sig.baseline or STRATEGY_BASELINE, sig.stage, sig.decision, sig.tier,
+              sig.direction, sig.reason,
+              json.dumps(sig.raw_actual) if sig.raw_actual is not None else None,
+              json.dumps(sig.normalized_actual) if sig.normalized_actual is not None else None,
+              json.dumps(sig.client_classification) if sig.client_classification is not None else None,
+              sig.scenario_key,
+              json.dumps(sig.warning_state) if sig.warning_state is not None else None,
+              json.dumps(sig.override_state) if sig.override_state is not None else None,
+              sig.reference_price, sig.proposed_entry, sig.proposed_sl, sig.proposed_tp,
+              sig.ui_path,
+              json.dumps(sig.client_payload) if sig.client_payload is not None else None,
+              sig.client_decision_at))
+        conn.commit()
+        return {"decision_id": sig.decision_id, "duplicate": False, "stored": True}
+    finally:
+        conn.close()
+
+
+@app.post("/api/executions")
+def ingest_execution(ex: ExecutionIn):
+    conn = get_db()
+    try:
+        existing = conn.execute("SELECT execution_id FROM executions WHERE execution_id = %s",
+                                (ex.execution_id,)).fetchone()
+        if existing:
+            return {"execution_id": ex.execution_id, "duplicate": True, "stored": False}
+        conn.execute("""
+            INSERT INTO executions (execution_id, opportunity_id, decision_id, status, broker,
+                direction, actual_fill_price, actual_sl, actual_tp, actual_rr, lot_size,
+                exit_price, realized_pips, realized_r, realized_pnl, notes,
+                execution_decision_at, actual_fill_at, actual_exit_at)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        """, (ex.execution_id, ex.opportunity_id, ex.decision_id, ex.status, ex.broker,
+              ex.direction, ex.actual_fill_price, ex.actual_sl, ex.actual_tp, ex.actual_rr,
+              ex.lot_size, ex.exit_price, ex.realized_pips, ex.realized_r, ex.realized_pnl,
+              ex.notes, ex.execution_decision_at, ex.actual_fill_at, ex.actual_exit_at))
+        conn.commit()
+        return {"execution_id": ex.execution_id, "duplicate": False, "stored": True}
+    finally:
+        conn.close()
+
+
+@app.post("/api/signal-corrections")
+def ingest_correction(c: CorrectionIn):
+    """Append-only. NEVER modifies decision_contexts or signals."""
+    conn = get_db()
+    try:
+        conn.execute("""
+            INSERT INTO signal_corrections (context_id, opportunity_id, field, old_value,
+                new_value, source, note)
+            VALUES (%s,%s,%s,%s,%s,%s,%s)
+        """, (c.context_id, c.opportunity_id, c.field, c.old_value, c.new_value,
+              c.source, c.note))
+        conn.commit()
+        return {"stored": True}
+    finally:
+        conn.close()
+
+
+@app.get("/api/signals")
+def list_signals(opportunity_id: Optional[str] = Query(None), limit: int = Query(100)):
+    conn = get_db()
+    try:
+        if opportunity_id:
+            rows = conn.execute("""SELECT * FROM signals WHERE opportunity_id = %s
+                ORDER BY client_decision_at ASC""", (opportunity_id,)).fetchall()
+        else:
+            rows = conn.execute("SELECT * FROM signals ORDER BY server_received_at DESC LIMIT %s",
+                                (limit,)).fetchall()
+        return {"signals": [dict(r) for r in rows], "baseline": STRATEGY_BASELINE}
+    finally:
+        conn.close()
+
+
+@app.get("/api/opportunity/{opportunity_id}")
+def get_opportunity(opportunity_id: str):
+    """Full audit trail: context -> every decision stage -> outcomes -> executions."""
+    conn = get_db()
+    try:
+        sigs = [dict(r) for r in conn.execute(
+            "SELECT * FROM signals WHERE opportunity_id=%s ORDER BY client_decision_at ASC",
+            (opportunity_id,)).fetchall()]
+        ctx = None
+        cids = [s["context_id"] for s in sigs if s.get("context_id")]
+        if cids:
+            row = conn.execute("SELECT * FROM decision_contexts WHERE context_id=%s",
+                               (cids[0],)).fetchone()
+            ctx = dict(row) if row else None
+        outs = [dict(r) for r in conn.execute(
+            "SELECT * FROM signal_outcomes WHERE opportunity_id=%s ORDER BY horizon",
+            (opportunity_id,)).fetchall()]
+        exs = [dict(r) for r in conn.execute(
+            "SELECT * FROM executions WHERE opportunity_id=%s ORDER BY recorded_at",
+            (opportunity_id,)).fetchall()]
+        corr = [dict(r) for r in conn.execute(
+            "SELECT * FROM signal_corrections WHERE opportunity_id=%s ORDER BY corrected_at",
+            (opportunity_id,)).fetchall()]
+        return {"opportunity_id": opportunity_id, "context": ctx, "decisions": sigs,
+                "outcomes": outs, "executions": exs, "corrections": corr}
+    finally:
+        conn.close()
+
+
+@app.get("/api/baseline")
+def get_baseline():
+    return BASELINE_REF
+
 
 @app.get("/")
 async def serve_frontend():

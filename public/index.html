@@ -153,6 +153,18 @@
   .live-verdict-buy{font-size:28px;font-weight:700;color:var(--green);margin:12px 0}
   .live-verdict-sell{font-size:28px;font-weight:700;color:var(--red);margin:12px 0}
   .live-verdict-skip{font-size:28px;font-weight:700;color:var(--amber);margin:12px 0}
+  /* Three discrete evidence states — not a gradient. Muted variants are
+     desaturated versions of --green/--red (same hue family), used when the
+     Wilson floor sits at or below the absolute coin-flip line. */
+  .live-verdict-buy.conf-weak{color:#5f8a6c;font-size:23px}
+  .live-verdict-sell.conf-weak{color:#a06767;font-size:23px}
+  .conf-chip{display:inline-block;padding:7px 14px;border-radius:8px;margin-top:10px;border:1px solid}
+  .conf-chip .conf-sub{font-family:var(--sans);font-size:12px;font-weight:700;letter-spacing:.4px}
+  .conf-strong{background:rgba(34,197,94,0.15);border-color:var(--green);color:var(--green)}
+  .conf-weak-chip{background:rgba(239,68,68,0.13);border-color:#a06767;color:#d98a8a}
+  .conf-none-chip{background:var(--surface2);border-color:var(--text3);color:var(--text2)}
+  .conf-numbers{font-family:var(--mono);font-size:14px;color:var(--text);margin-top:9px}
+  .conf-numbers strong{color:var(--text);font-weight:700}
   .live-progress{height:10px;border-radius:5px;background:linear-gradient(90deg,var(--red),var(--green));position:relative;margin:12px 0}
   .live-progress-marker{position:absolute;top:-4px;width:4px;height:18px;background:var(--accent);border-radius:2px;transform:translateX(-50%)}
   .live-stage-box{padding:16px;border-radius:10px;margin-top:12px;line-height:1.7;font-size:13px}
@@ -292,6 +304,143 @@ function emptyTradesMessage(type) {
   }
   return 'No trades yet. Log your first trade to see KPIs here.';
 }
+
+// ══ SIGNAL LOGGING — durable outbox ═══════════════════════
+// Instrumentation of the frozen baseline. MUST NEVER alter a recommendation.
+// Sequence: decision computed -> decision_id minted -> queued durably ->
+// verdict rendered -> POST attempted. A verdict can never appear on screen
+// and then vanish from history.
+const LOG_DB = 'fxSignalOutbox', LOG_STORE = 'pending', LOG_VER = 1;
+let _logDb = null, _logBroken = false, _logFlushing = false;
+
+function _uuid() {
+  if (crypto && crypto.randomUUID) return crypto.randomUUID().replace(/-/g, '').slice(0, 24);
+  return 'id' + Date.now().toString(36) + Math.random().toString(36).slice(2, 12);
+}
+
+function openLogDb() {
+  if (_logDb) return Promise.resolve(_logDb);
+  return new Promise((resolve, reject) => {
+    let req;
+    try { req = indexedDB.open(LOG_DB, LOG_VER); } catch (e) { return reject(e); }
+    req.onupgradeneeded = () => {
+      const db = req.result;
+      if (!db.objectStoreNames.contains(LOG_STORE)) db.createObjectStore(LOG_STORE, { keyPath: 'decision_id' });
+    };
+    req.onsuccess = () => { _logDb = req.result; resolve(_logDb); };
+    req.onerror = () => reject(req.error);
+  });
+}
+
+function _idbPut(rec) {
+  return openLogDb().then(db => new Promise((res, rej) => {
+    const tx = db.transaction(LOG_STORE, 'readwrite');
+    tx.objectStore(LOG_STORE).put(rec);
+    tx.oncomplete = res; tx.onerror = () => rej(tx.error);
+  }));
+}
+function _idbDel(id) {
+  return openLogDb().then(db => new Promise((res, rej) => {
+    const tx = db.transaction(LOG_STORE, 'readwrite');
+    tx.objectStore(LOG_STORE).delete(id);
+    tx.oncomplete = res; tx.onerror = () => rej(tx.error);
+  }));
+}
+function _idbAll() {
+  return openLogDb().then(db => new Promise((res, rej) => {
+    const tx = db.transaction(LOG_STORE, 'readonly');
+    const rq = tx.objectStore(LOG_STORE).getAll();
+    rq.onsuccess = () => res(rq.result || []); rq.onerror = () => rej(rq.error);
+  }));
+}
+
+function showLoggingUnavailable(on) {
+  let el = document.getElementById('log-unavailable');
+  if (on) {
+    if (!el) {
+      el = document.createElement('div');
+      el.id = 'log-unavailable';
+      el.style.cssText = 'position:fixed;bottom:12px;left:12px;z-index:9999;background:var(--red-dim);'
+        + 'border:1px solid var(--red);color:var(--red);padding:8px 14px;border-radius:8px;'
+        + 'font-size:12px;font-weight:700;letter-spacing:.5px';
+      el.textContent = '⚠ SIGNAL LOGGING UNAVAILABLE';
+      document.body.appendChild(el);
+    }
+  } else if (el) el.remove();
+}
+
+// Queue a decision durably, then attempt delivery. Never throws into the caller.
+async function logDecision(rec) {
+  try {
+    rec.decision_id = rec.decision_id || _uuid();
+    rec.client_decision_at = rec.client_decision_at || new Date().toISOString();
+    rec.baseline = rec.baseline || 'baseline-2026-09-05';
+    rec._attempts = 0;
+    try {
+      await _idbPut(rec);
+      if (_logBroken) { _logBroken = false; showLoggingUnavailable(false); }
+    } catch (e) {
+      _logBroken = true; showLoggingUnavailable(true);
+      console.error('signal outbox persist failed', e);
+    }
+    flushOutbox();
+    return rec.decision_id;
+  } catch (e) {
+    console.error('logDecision failed (recommendation unaffected)', e);
+    _logBroken = true; showLoggingUnavailable(true);
+    return null;
+  }
+}
+
+async function _send(rec) {
+  const body = Object.assign({}, rec); delete body._attempts;
+  const r = await fetch(API + '/signals', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
+  });
+  if (!r.ok) throw new Error('HTTP ' + r.status);
+  return r.json();
+}
+
+async function flushOutbox() {
+  if (_logFlushing) return;
+  _logFlushing = true;
+  try {
+    const items = await _idbAll();
+    for (const rec of items) {
+      try {
+        await _send(rec);            // server is idempotent on decision_id
+        await _idbDel(rec.decision_id);
+      } catch (e) {
+        rec._attempts = (rec._attempts || 0) + 1;
+        try { await _idbPut(rec); } catch (_) {}
+        const backoff = Math.min(60000, 1000 * Math.pow(2, Math.min(rec._attempts, 6)));
+        setTimeout(flushOutbox, backoff);   // bounded backoff
+        break;
+      }
+    }
+  } catch (e) {
+    console.error('flushOutbox error', e);
+  } finally { _logFlushing = false; }
+}
+
+// retry triggers: page load, connectivity restored, periodic, and a best-effort
+// final delivery on pagehide (never the sole mechanism).
+window.addEventListener('online', flushOutbox);
+window.addEventListener('load', flushOutbox);
+setInterval(flushOutbox, 60000);
+window.addEventListener('pagehide', () => {
+  _idbAll().then(items => {
+    for (const rec of items) {
+      const body = Object.assign({}, rec); delete body._attempts;
+      try {
+        navigator.sendBeacon
+          ? navigator.sendBeacon(API + '/signals', new Blob([JSON.stringify(body)], { type: 'application/json' }))
+          : fetch(API + '/signals', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+                                      body: JSON.stringify(body), keepalive: true });
+      } catch (_) {}
+    }
+  }).catch(() => {});
+});
 
 // ── API HELPERS ───────────────────────────────────────────
 async function api(method, path, body) {
@@ -1283,20 +1432,69 @@ function stopLiveAssistant() {
   liveAssistantState = null;
 }
 
-function parseBriefNumber(val) {
+// Parse a printed figure, keeping the unit suffix so a bare user-typed number can
+// be reconciled against a suffixed forecast. Returns {value, suffix, hasSuffix}.
+function parseBriefNumberEx(val) {
   if (val == null || val === '' || val === '—') return null;
   const s = String(val).replace(/%/g, '').replace(/,/g, '').trim();
-  const m = s.match(/^(-?[\d.]+)\s*([KkMm])?$/);
+  const m = s.match(/^(-?[\d.]+)\s*([KkMmBb])?$/);
   if (!m) return null;
-  let n = parseFloat(m[1]);
-  if (isNaN(n)) return null;
-  if (m[2] && m[2].toUpperCase() === 'K') n *= 1000;
-  if (m[2] && m[2].toUpperCase() === 'M') n *= 1000000;
-  return n;
+  const base = parseFloat(m[1]);
+  if (isNaN(base)) return null;
+  const suffix = m[2] ? m[2].toUpperCase() : '';
+  const mult = suffix === 'K' ? 1e3 : suffix === 'M' ? 1e6 : suffix === 'B' ? 1e9 : 1;
+  return { value: base * mult, base, suffix, hasSuffix: !!suffix };
+}
+
+function parseBriefNumber(val) {
+  const p = parseBriefNumberEx(val);
+  return p ? p.value : null;
+}
+
+function fmtWithSuffix(base, suffix) {
+  return `${base}${suffix || ''}`;
+}
+
+// Reconcile a user-typed actual against the forecast's units before any beat/miss
+// comparison. A bare "162" typed against a "55K" forecast previously compared
+// 162 vs 55000 and inverted a correct SELL into a BUY.
+//   - forecast carries a suffix, actual does not  -> infer and apply the suffix
+//   - still >=100x apart after that               -> block, do not classify
+function reconcileActual(actualStr, forecastStr) {
+  const a = parseBriefNumberEx(actualStr);
+  const f = parseBriefNumberEx(forecastStr);
+  if (!a || !f) return { ok: !!a, value: a ? a.value : null, note: '', blocked: false };
+
+  let value = a.value, note = '', inferred = false;
+  if (f.hasSuffix && !a.hasSuffix) {
+    const mult = f.suffix === 'K' ? 1e3 : f.suffix === 'M' ? 1e6 : f.suffix === 'B' ? 1e9 : 1;
+    value = a.base * mult;
+    inferred = true;
+    note = `Read as ${fmtWithSuffix(a.base, f.suffix)} (matched to forecast units ${fmtWithSuffix(f.base, f.suffix)}).`;
+  }
+
+  // Magnitude sanity check on the reconciled values.
+  if (Math.abs(f.value) > 0 && Math.abs(value) > 0) {
+    const ratio = Math.abs(value) / Math.abs(f.value);
+    if (ratio >= 100 || ratio <= 0.01) {
+      return {
+        ok: false, blocked: true, value, note,
+        message: `Units look mismatched: forecast is ${forecastStr}, you entered "${actualStr}"`
+               + `${inferred ? ' (read as ' + fmtWithSuffix(a.base, f.suffix) + ')' : ''}`
+               + ` — that is ${ratio >= 100 ? Math.round(ratio) + '×' : '1/' + Math.round(1 / ratio)} the forecast.`
+               + ` Re-enter the actual in the same units as the forecast (${forecastStr}).`,
+      };
+    }
+  }
+  return { ok: true, blocked: false, value, note, inferred };
 }
 
 function calcBeatMissLive(actualStr, forecastStr, absThreshold = 1.0, valueType = 'percent') {
-  const a = parseBriefNumber(actualStr);
+  // Reconcile units first — a bare number typed against a suffixed forecast
+  // (e.g. "162" vs "55K") must not be compared raw.
+  const rec = reconcileActual(actualStr, forecastStr);
+  if (rec && rec.blocked) return { scenario: 'blocked', percentDiff: null, method: 'blocked', message: rec.message };
+  const a = rec && rec.value !== null && rec.value !== undefined ? rec.value : parseBriefNumber(actualStr);
   const f = parseBriefNumber(forecastStr);
   if (a === null || f === null) return { scenario: 'match', percentDiff: 0, method: 'proportional' };
   const diff = a - f;
@@ -1316,16 +1514,69 @@ function calcBeatMissLive(actualStr, forecastStr, absThreshold = 1.0, valueType 
   return { scenario: 'miss', percentDiff: pct, method: 'proportional' };
 }
 
+// ABSOLUTE statistical line — deliberately NOT derived from this dataset's own
+// distribution of floors. Grading signals against each other would let an
+// above-average-mediocre signal read as "strong" simply because most others are
+// worse. Wilson 95% lower bound > 50% means "meaningfully better than a coin
+// flip" in absolute terms. This is not a tuned parameter and does not move.
+const CONF_WLB_LINE = 50.0;
+
+// Three DISTINCT states — not a gradient:
+//   'none'      -> no direction exists at all (tie / missing data)  [gray]
+//   'lean'      -> a real lean, but floor <= 50%                    [muted]
+//   'candidate' -> floor > 50%                                      [vivid]
+function confidenceTier(wlb) {
+  if (wlb == null) return { tier:'none', cls:'conf-none', chip:'conf-none-chip', label:'NO DIRECTIONAL DATA' };
+  if (wlb > CONF_WLB_LINE) return { tier:'candidate', cls:'', chip:'conf-strong', label:'Strong historical directional evidence' };
+  return { tier:'lean', cls:'conf-weak', chip:'conf-weak-chip', label:'Weak evidence — discretionary only' };
+}
+
+// Always-visible evidence readout: raw N, raw percentage and the Wilson lower
+// bound, shown at full size next to the direction — never small print or tooltip.
+function confidenceChip(wlb, consistency, n) {
+  const t = confidenceTier(wlb);
+  return `<div class="conf-chip ${t.chip}"><span class="conf-sub">${t.label}</span></div>
+    <div class="conf-numbers">
+      n=<strong>${n != null ? n : '—'}</strong> &nbsp;·&nbsp;
+      raw <strong>${consistency != null ? consistency + '%' : '—'}</strong> &nbsp;·&nbsp;
+      95% floor <strong>${wlb == null ? '—' : wlb + '%'}</strong>
+    </div>`;
+}
+
 function getLiveRecommendation(brief, scenario) {
   if (scenario === 'match') return { action: 'SKIP', dir: null, header: 'DATA MATCHED FORECAST', color: 'var(--amber)' };
-  if (scenario === 'beat') {
-    if (brief.beat_direction === 'up') return { action: 'BUY', dir: 'up', header: 'DATA BEAT FORECAST', color: 'var(--green)' };
-    if (brief.beat_direction === 'down') return { action: 'SELL', dir: 'down', header: 'DATA BEAT FORECAST', color: 'var(--green)' };
-    return { action: 'SKIP', dir: null, header: 'DATA BEAT FORECAST', color: 'var(--green)' };
+  const isBeat = scenario === 'beat';
+  const dir        = isBeat ? brief.beat_direction    : brief.miss_direction;
+  const tradeable  = isBeat ? brief.beat_tradeable    : brief.miss_tradeable;
+  const wlb        = isBeat ? brief.beat_wilson_lower : brief.miss_wilson_lower;
+  const consistency= isBeat ? brief.beat_consistency  : brief.miss_consistency;
+  const dirN       = isBeat ? brief.beat_dir_n        : brief.miss_dir_n;
+  const header = isBeat ? 'DATA BEAT FORECAST' : 'DATA MISSED FORECAST';
+  const color  = isBeat ? 'var(--green)' : 'var(--red)';
+  // STATE 1 (hard block): a tie or no directional data — no direction exists.
+  if (!dir) {
+    return { action: 'SKIP', dir: null, header, color: 'var(--amber)', noDirection: true,
+             weakReason: 'No clear direction — historical occurrences are split evenly (or no directional data exists). Nothing to lean on here.' };
   }
-  if (brief.miss_direction === 'up') return { action: 'BUY', dir: 'up', header: 'DATA MISSED FORECAST', color: 'var(--red)' };
-  if (brief.miss_direction === 'down') return { action: 'SELL', dir: 'down', header: 'DATA MISSED FORECAST', color: 'var(--red)' };
-  return { action: 'SKIP', dir: null, header: 'DATA MISSED FORECAST', color: 'var(--red)' };
+  // STATE 2/3: a real lean is always shown. The absolute Wilson line decides
+  // whether it reads as a discretionary lean or a directional candidate.
+  const t = confidenceTier(wlb);
+  const isLean = t.tier === 'lean';
+  return {
+    action: dir === 'up' ? 'BUY' : 'SELL', dir, header,
+    color: isLean ? (dir === 'up' ? '#5f8a6c' : '#a06767') : color,
+    wlb, consistency, dirN, tradeable, confTier: t.tier, confCls: t.cls,
+    verdictText: isLean
+      ? `Historical Lean: ${dir === 'up' ? 'BUY' : 'SELL'}`
+      // "SUPPORTED DIRECTION", not "CANDIDATE": a Wilson floor above 50%
+      // establishes a statistically supported *direction*, not proven
+      // profitability. "TRADE CANDIDATE" is reserved until post-5-minute,
+      // cost-adjusted, out-of-sample expectancy is established.
+      : `SUPPORTED DIRECTION: ${dir === 'up' ? 'BUY' : 'SELL'}`,
+    weakNote: isLean
+      ? `Weak evidence — discretionary only. The 95% confidence floor (${wlb == null ? '—' : wlb + '%'} on n=${dirN || 0}) is not above a coin flip, so this lean is for your judgement to weigh, not a statistically supported call.`
+      : null,
+  };
 }
 
 function livePips(from, to) {
@@ -1432,7 +1683,10 @@ function initLiveAssistant(brief, extraBriefs, groupData) {
   const sameTime = (extraBriefs && extraBriefs.length)
     ? extraBriefs.map(b => ({ your_name: b.event_name, _brief: b }))
     : getSameTimeEvents(brief);
-  liveAssistantState = { brief, stage: 'before', sameTimeEvents: sameTime, groupData: groupData || null };
+  // One opportunity_id spans every decision stage for this trading opportunity.
+  liveAssistantState = { brief, stage: 'before', sameTimeEvents: sameTime, groupData: groupData || null,
+                         opportunityId: 'opp_' + _uuid(),
+                         contextId: (groupData && groupData.context_id) || brief.context_id || null };
   renderLiveBefore();
 }
 
@@ -1441,6 +1695,28 @@ async function checkDailyLimitBlocked() {
     const status = await GET('/daily-status');
     return status.daily_limit_hit || status.trade_limit_hit ? status : null;
   } catch(e) { return null; }
+}
+
+// Live echo of how a typed actual will actually be interpreted, shown next to the
+// forecast so a units mismatch is visible before any recommendation is produced.
+function echoParsedActual(inputId, forecastStr, echoId) {
+  const inp = document.getElementById(inputId);
+  const out = document.getElementById(echoId);
+  if (!inp || !out) return;
+  const raw = inp.value.trim();
+  if (!raw) { out.innerHTML = ''; return; }
+  const rec = reconcileActual(raw, forecastStr);
+  const f = parseBriefNumberEx(forecastStr);
+  const fLabel = f ? fmtWithSuffix(f.base, f.suffix) : (forecastStr || '—');
+  if (rec && rec.blocked) {
+    out.innerHTML = `<span style="color:var(--red)">⚠ ${rec.message}</span>`;
+    return;
+  }
+  const a = parseBriefNumberEx(raw);
+  if (!a) { out.innerHTML = `<span style="color:var(--red)">⚠ Not a number.</span>`; return; }
+  const shown = rec && rec.inferred ? fmtWithSuffix(a.base, f ? f.suffix : '') : fmtWithSuffix(a.base, a.suffix);
+  const inferNote = rec && rec.inferred ? ' <span style="color:var(--amber)">(units inferred from forecast)</span>' : '';
+  out.innerHTML = `<span style="color:var(--text2)">Reading as <span class="mono">${shown}</span> vs forecast <span class="mono">${fLabel}</span>${inferNote}</span>`;
 }
 
 function renderLiveBefore() {
@@ -1459,19 +1735,27 @@ function renderLiveBefore() {
       <div style="margin-top:6px;font-size:11px;color:var(--text2)">Enter actuals for ALL of them to get a combined signal.</div>
     </div>
     <div style="margin-bottom:10px">
-      <label style="font-size:11px;font-weight:600;color:var(--text2);text-transform:uppercase;letter-spacing:0.8px">${b.event_name.replace(/ US$| UK$/,'')} — Actual</label>
-      <input type="text" id="live-actual-main" placeholder="e.g. 54.2" style="width:100%;margin-top:6px">
+      <label style="font-size:11px;font-weight:600;color:var(--text2);text-transform:uppercase;letter-spacing:0.8px">${b.event_name.replace(/ US$| UK$/,'')} — Actual <span style="text-transform:none;font-weight:400">· forecast <span class="mono">${b.forecast || '—'}</span></span></label>
+      <input type="text" id="live-actual-main" placeholder="e.g. 54.2" style="width:100%;margin-top:6px"
+             oninput="echoParsedActual('live-actual-main', ${JSON.stringify(String(b.forecast || ''))}, 'live-echo-main')">
+      <div id="live-echo-main" style="font-size:11px;margin-top:4px;min-height:14px"></div>
     </div>
-    ${same.map(e=>`<div style="margin-bottom:10px">
-      <label style="font-size:11px;font-weight:600;color:var(--text2);text-transform:uppercase;letter-spacing:0.8px">${(e.your_name||'').replace(/ US$| UK$/,'')} — Actual</label>
-      <input type="text" id="${safeId(e.your_name)}" placeholder="e.g. 47.4" style="width:100%;margin-top:6px">
-    </div>`).join('')}`;
+    ${same.map(e=>{
+      const fc = String((e._brief && e._brief.forecast) || '');
+      return `<div style="margin-bottom:10px">
+      <label style="font-size:11px;font-weight:600;color:var(--text2);text-transform:uppercase;letter-spacing:0.8px">${(e.your_name||'').replace(/ US$| UK$/,'')} — Actual <span style="text-transform:none;font-weight:400">· forecast <span class="mono">${fc || '—'}</span></span></label>
+      <input type="text" id="${safeId(e.your_name)}" placeholder="e.g. 47.4" style="width:100%;margin-top:6px"
+             oninput="echoParsedActual('${safeId(e.your_name)}', ${JSON.stringify(fc)}, 'echo-${safeId(e.your_name)}')">
+      <div id="echo-${safeId(e.your_name)}" style="font-size:11px;margin-top:4px;min-height:14px"></div>
+    </div>`;}).join('')}`;
   } else {
     sameHtml = `<div style="font-size:12px;color:var(--text2);margin-bottom:12px">News hasn't released yet? Come back when you have the actual number.</div>
-    <label style="font-size:11px;font-weight:600;color:var(--text2);text-transform:uppercase;letter-spacing:0.8px">Actual Number (enter when news releases)</label>
+    <label style="font-size:11px;font-weight:600;color:var(--text2);text-transform:uppercase;letter-spacing:0.8px">Actual Number (enter when news releases) <span style="text-transform:none;font-weight:400">· forecast <span class="mono">${b.forecast || '—'}</span></span></label>
     <div style="display:flex;gap:10px;margin-top:8px;align-items:center">
-      <input type="text" id="live-actual-input" placeholder="e.g. 54.2, 172K, 3.8%" style="flex:1">
-    </div>`;
+      <input type="text" id="live-actual-input" placeholder="e.g. 54.2, 172K, 3.8%" style="flex:1"
+             oninput="echoParsedActual('live-actual-input', ${JSON.stringify(String(b.forecast || ''))}, 'live-echo-single')">
+    </div>
+    <div id="live-echo-single" style="font-size:11px;margin-top:6px;min-height:14px"></div>`;
   }
   el.innerHTML = `${sameHtml}
     <div style="margin-top:12px">
@@ -1530,11 +1814,31 @@ async function startLiveMode() {
     if (parseBriefNumber(actual) === null || parseBriefNumber(b.forecast) === null) {
       if (errEl) errEl.textContent = 'Could not parse actual or forecast. Enter a plain number (e.g. 54.2).'; return;
     }
-    const { scenario, percentDiff } = calcBeatMissLive(actual, b.forecast, b.abs_threshold || 1.0, b.value_type || 'percent');
+    const { scenario, percentDiff, message } = calcBeatMissLive(actual, b.forecast, b.abs_threshold || 1.0, b.value_type || 'percent');
+    if (scenario === 'blocked') { if (errEl) errEl.textContent = message; return; }
     const rec = getLiveRecommendation(b, scenario);
-    liveAssistantState = { brief:b, stage:'A', actual, openPrice, currentPrice:openPrice, scenario, percentDiff, rec, countdownSecs:300, entryPrice:null, priceTimer:null, countdownTimer:null };
+    liveAssistantState = { brief:b, stage:'A', actual, openPrice, currentPrice:openPrice, scenario, percentDiff, rec, countdownSecs:300, entryPrice:null, priceTimer:null, countdownTimer:null,
+      opportunityId: la.opportunityId, contextId: la.contextId };
+    logDecision({
+      opportunity_id: la.opportunityId, context_id: la.contextId, stage: 'STAGE_A',
+      decision: rec.noDirection ? 'NO_DIRECTION'
+              : rec.action === 'SKIP' ? (scenario === 'match' ? 'SKIP' : 'HISTORICAL_LEAN_SKIP')
+              : (rec.confTier === 'candidate' ? 'SUPPORTED_DIRECTION_' : 'HISTORICAL_LEAN_') + rec.action,
+      tier: rec.confTier || null, direction: rec.dir || null,
+      reason: rec.weakNote || rec.weakReason || rec.header || null,
+      raw_actual: { main: actual }, normalized_actual: { main: parseBriefNumber(actual) },
+      client_classification: { scenario, percentDiff, wilson_lower: rec.wlb ?? null,
+                               consistency: rec.consistency ?? null, dir_n: rec.dirN ?? null },
+      scenario_key: scenario, reference_price: openPrice,
+      warning_state: { weak: !!rec.weakNote }, override_state: { available: false },
+      ui_path: 'single/StageA',
+      client_payload: { event: b.event_name, forecast: b.forecast, action: rec.action }
+    });
     renderLiveStageA();
-    if (rec.action !== 'SKIP') startLiveCountdown(); else renderLiveSkipWait();
+    // Tier 1 -> hard block; Tier 2 -> explicit opt-in gate; Tier 3 -> straight through.
+    if (rec.action === 'SKIP') renderLiveSkipWait();
+    else if (rec.confTier === 'lean') renderLeanGate();
+    else startLiveCountdown();
     return;
   }
 
@@ -1548,10 +1852,25 @@ async function startLiveMode() {
     ));
     const allBriefs = [b, ...fetched.filter(Boolean)];
 
+    // Block before classifying if any input's units are inconsistent with its forecast.
+    const unitProblems = allBriefs
+      .map(br => ({ name: br.event_name, rec: reconcileActual(actuals[br.event_name] || '', br.forecast) }))
+      .filter(x => x.rec && x.rec.blocked);
+    if (unitProblems.length) {
+      if (panel) panel.innerHTML = '';
+      renderLiveBefore();
+      const e2 = document.getElementById('live-before-error');
+      if (e2) e2.textContent = unitProblems.map(x => `${x.name.replace(/ US$| UK$/,'')}: ${x.rec.message}`).join('  ');
+      return;
+    }
+
     const verdicts = allBriefs.map(br => {
       const actual = actuals[br.event_name] || '';
       if (!actual || parseBriefNumber(actual) === null || parseBriefNumber(br.forecast) === null) {
-        return { eventName:br.event_name, action:'SKIP', dir:null, confidence:null, occurrences:0, surprisePct:0, avgPip5m:br.avg_pip_5m||0, brief:br, scenarioKey:'inline' };
+        // Missing/unparseable forecast is NOT the same as "the print matched forecast".
+        // Coercing it to 'inline' previously let a data gap masquerade as a real
+        // scenario and feed the historical-pattern lookup.
+        return { eventName:br.event_name, action:'SKIP', dir:null, confidence:null, occurrences:0, surprisePct:0, avgPip5m:br.avg_pip_5m||0, brief:br, scenarioKey:'unknown', noData:true };
       }
       const { scenario, percentDiff } = calcBeatMissLive(actual, br.forecast, br.abs_threshold || 1.0, br.value_type || 'percent');
       const rec = getLiveRecommendation(br, scenario);
@@ -1563,29 +1882,54 @@ async function startLiveMode() {
     // Resolve combined verdict — prefer co-occurrence data if available
     const groupData = la.groupData;
     let combined;
-    if (groupData && groupData.has_sufficient_data) {
+    const noDataEvents = verdicts.filter(v => v.noData);
+    if (noDataEvents.length) {
+      combined = {
+        action: 'NO TRADE', dir: null, color: 'var(--amber)',
+        header: 'MISSING FORECAST DATA — NO TRADE',
+        combinedConf: null, avgPip: 0,
+        reasoning: `No usable forecast for ${noDataEvents.map(v => v.eventName.replace(/ US$| UK$/,'')).join(', ')}, `
+                 + `so beat/miss cannot be determined for ${noDataEvents.length > 1 ? 'these events' : 'this event'}. `
+                 + `A missing forecast is not the same as a print that matched forecast — no directional signal can be derived. Skip this release.`,
+        tags: verdicts.map(v => `${v.eventName.replace(/ US$| UK$/,'')}: ${v.noData ? 'NO DATA' : v.scenarioKey.toUpperCase()}`),
+      };
+    } else if (groupData && groupData.has_sufficient_data) {
       // Build scenario key in sorted-name order (matches group_key order)
       const sortedV = [...verdicts].sort((a, b) => a.eventName.localeCompare(b.eventName));
       const scenarioKey = sortedV.map(v => v.scenarioKey).join('|');
       const scRow = (groupData.scenarios || []).find(s => s.scenario === scenarioKey);
-      if (scRow && scRow.count >= 3) {
-        const dir = scRow.direction;
+      const scTags = () => sortedV.map(v => `${v.eventName.replace(/ US$| UK$/,'')}: ${v.scenarioKey.toUpperCase()}`);
+      if (scRow && !scRow.direction) {
+        // HARD BLOCK 1 of 2: a genuine tie. There is no direction to weight.
         combined = {
-          action: dir === 'up' ? 'BUY' : 'SELL', dir,
-          color: dir === 'up' ? 'var(--green)' : 'var(--red)',
-          header: `HISTORICAL PATTERN — ${dir === 'up' ? 'BUY' : 'SELL'}`,
-          combinedConf: scRow.consistency, avgPip: scRow.avg_pip_5m || 0,
-          reasoning: `This exact combination has happened ${scRow.count} time${scRow.count !== 1 ? 's' : ''} before. GBP/USD went ${dir.toUpperCase()} ${scRow.consistency}% of those times, averaging ${(scRow.avg_pip_5m || 0).toFixed(1)}p in the first 5 minutes.`,
-          tags: sortedV.map(v => `${v.eventName.replace(/ US$| UK$/,'')}: ${v.scenarioKey.toUpperCase()}`),
+          action: 'NO TRADE', dir: null,
+          color: 'var(--amber)', header: 'NO CLEAR DIRECTION — NO TRADE',
+          combinedConf: null, avgPip: scRow.avg_pip_5m || 0, dirN: scRow.up_count + scRow.down_count,
+          reasoning: `This combination has happened ${scRow.count} time${scRow.count !== 1 ? 's' : ''}, split exactly ${scRow.up_count} up / ${scRow.down_count} down. A tie carries no directional information — there is no lean to weigh.`,
+          tags: scTags(),
         };
       } else if (scRow) {
+        // A real lean exists — always shown, with its actual numbers. Strength
+        // drives visual weight only (see confidenceTier). Weak calls are the
+        // trader's to weigh against his own analysis, not the app's to hide.
         const dir = scRow.direction;
+        const t = confidenceTier(scRow.wilson_lower);
+        const dirN = scRow.up_count + scRow.down_count;
+        const isLean = t.tier === 'lean';
+        const side = dir === 'up' ? 'BUY' : 'SELL';
+        const verdictText = isLean ? `Historical Lean: ${side}` : `SUPPORTED DIRECTION: ${side}`;
         combined = {
-          action: dir === 'up' ? 'BUY' : 'SELL', dir,
-          color: 'var(--amber)', header: 'CAUTION — SMALL SAMPLE',
+          action: side, dir, verdictText,
+          color: isLean ? (dir === 'up' ? '#5f8a6c' : '#a06767') : (dir === 'up' ? 'var(--green)' : 'var(--red)'),
+          header: isLean ? 'HISTORICAL LEAN' : 'STRONG HISTORICAL DIRECTIONAL EVIDENCE',
           combinedConf: scRow.consistency, avgPip: scRow.avg_pip_5m || 0,
-          reasoning: `This combination has only happened ${scRow.count} time${scRow.count !== 1 ? 's' : ''} before. Not enough history to be confident. Consider skipping or using smaller position size.`,
-          tags: sortedV.map(v => `${v.eventName.replace(/ US$| UK$/,'')}: ${v.scenarioKey.toUpperCase()}`),
+          wlb: scRow.wilson_lower, dirN, confTier: t.tier, confCls: t.cls,
+          reasoning: `This exact combination has happened ${scRow.count} time${scRow.count !== 1 ? 's' : ''} before (${scRow.up_count} up / ${scRow.down_count} down). GBP/USD went ${dir.toUpperCase()} ${scRow.consistency}% of those times, averaging ${(scRow.avg_pip_5m || 0).toFixed(1)}p in the first 5 minutes.`
+            + (scRow.all_inline ? ` Note: every event here matched forecast — inline releases historically show no reliable direction.` : ''),
+          weakNote: isLean
+            ? `Weak evidence — discretionary only. The 95% confidence floor (${scRow.wilson_lower}% on n=${dirN}) is not above a coin flip, so this lean is for your judgement to weigh, not a statistically supported call.`
+            : null,
+          tags: scTags(),
         };
       } else {
         combined = resolveCombinedSignal(verdicts);
@@ -1599,12 +1943,35 @@ async function startLiveMode() {
       brief:b, stage:'A', actual:actuals[b.event_name], openPrice, currentPrice:openPrice,
       scenario: combined.action==='BUY'||combined.action==='SELL' ? 'beat' : 'match',
       percentDiff: verdicts[0]?.surprisePct||0,
-      rec: { action: combined.action==='NO TRADE'?'SKIP':combined.action, dir:combined.dir, header:combined.header, color:combined.color },
+      rec: { action: combined.action==='NO TRADE'?'SKIP':combined.action, dir:combined.dir, header:combined.header, color:combined.color,
+             weakReason: (combined.action==='NO TRADE'||combined.action==='SKIP') ? combined.reasoning : null },
       countdownSecs:300, entryPrice:null, priceTimer:null, countdownTimer:null,
       multiMode:true, verdicts, combined, groupData,
     };
+    logDecision({
+      opportunity_id: la.opportunityId, context_id: la.contextId, stage: 'STAGE_A',
+      decision: combined.action === 'NO TRADE'
+              ? (noDataEvents.length ? 'MISSING_FORECAST' : 'NO_DIRECTION')
+              : (combined.confTier === 'candidate' ? 'SUPPORTED_DIRECTION_' : 'HISTORICAL_LEAN_') + combined.action,
+      tier: combined.confTier || null, direction: combined.dir || null,
+      reason: combined.reasoning || combined.header || null,
+      raw_actual: actuals,
+      normalized_actual: Object.fromEntries(Object.entries(actuals).map(([k,v]) => [k, parseBriefNumber(v)])),
+      client_classification: { verdicts: verdicts.map(v => ({ event: v.eventName, scenario: v.scenarioKey,
+                                 action: v.action, confidence: v.confidence, occurrences: v.occurrences })),
+                               wilson_lower: combined.wlb ?? null, dir_n: combined.dirN ?? null },
+      scenario_key: (verdicts || []).map(v => v.scenarioKey).join('|'),
+      reference_price: openPrice,
+      warning_state: { weak: combined.confTier === 'lean', no_data: noDataEvents.length > 0 },
+      override_state: { available: false },
+      ui_path: 'group/StageA',
+      client_payload: { header: combined.header, tags: combined.tags || null }
+    });
     renderLiveCombinedStageA();
-    if (combined.action!=='SKIP' && combined.action!=='NO TRADE') startLiveCountdown(); else renderLiveSkipWait();
+    // Tier 1 -> hard block; Tier 2 -> explicit opt-in gate; Tier 3 -> straight through.
+    if (combined.action === 'SKIP' || combined.action === 'NO TRADE') renderLiveSkipWait();
+    else if (combined.confTier === 'lean') renderLeanGate();
+    else startLiveCountdown();
   } catch(e) {
     if (errEl) errEl.textContent = `Error: ${e.message}`;
   }
@@ -1622,15 +1989,23 @@ function renderLiveStageA() {
   else if (la.percentDiff >= 5) moveExpect = `Expect average move, ~<span class="mono">${avg5.toFixed(1)}p</span>`;
   const conf = la.scenario === 'beat' ? b.beat_consistency : la.scenario === 'miss' ? b.miss_consistency : null;
   const count = la.scenario === 'beat' ? b.beat_count : la.scenario === 'miss' ? b.miss_count : 0;
+  const cls = la.rec.confCls ? ' ' + la.rec.confCls : '';
+  const vt = la.rec.verdictText || '';
   let dirHtml = '<div class="live-verdict-skip">⚠ SKIP — no clear signal on match scenarios</div>';
-  if (la.rec.action === 'BUY') dirHtml = '<div class="live-verdict-buy">▲ BUY GBP/USD</div>';
-  if (la.rec.action === 'SELL') dirHtml = '<div class="live-verdict-sell">▼ SELL GBP/USD</div>';
+  if (la.rec.noDirection) dirHtml = '<div class="live-verdict-skip">⚠ NO CLEAR DIRECTION</div>';
+  else if (la.rec.action === 'BUY') dirHtml = `<div class="live-verdict-buy${cls}">▲ ${vt} — GBP/USD</div>`;
+  else if (la.rec.action === 'SELL') dirHtml = `<div class="live-verdict-sell${cls}">▼ ${vt} — GBP/USD</div>`;
+  const chip = la.rec.dir ? confidenceChip(la.rec.wlb, la.rec.consistency, la.rec.dirN) : '';
+  const weakBanner = la.rec.weakNote
+    ? `<div style="background:rgba(239,68,68,0.10);border-left:3px solid #a06767;padding:9px 12px;border-radius:0 6px 6px 0;margin-top:12px;font-size:12px;color:#d98a8a">⚠ ${la.rec.weakNote}</div>`
+    : '';
   el.innerHTML = `
     <div style="font-size:11px;font-weight:700;letter-spacing:1px;color:${la.rec.color}">${la.rec.header}</div>
     <div style="padding:14px;border:1px solid ${la.rec.color};border-radius:8px;background:var(--surface);margin-top:10px">
       ${dirHtml}
-      <div style="font-size:12px;color:var(--text2);margin-top:8px">
-        Confidence: <span class="mono">${conf != null ? conf + '%' : '—'}</span> reliable based on <span class="mono">${count || 0}</span> past occurrences<br>
+      ${chip}
+      ${weakBanner}
+      <div style="font-size:12px;color:var(--text2);margin-top:10px">
         Surprise size: <span class="mono">${la.percentDiff != null ? la.percentDiff.toFixed(1) + '%' : Math.abs((parseBriefNumber(la.actual)||0)-(parseBriefNumber(la.brief.forecast)||0)).toFixed(2) + ' (abs)'}</span> off forecast<br>
         ${moveExpect}
       </div>
@@ -1644,22 +2019,31 @@ function renderLiveCombinedStageA() {
   if (!el || !la) return;
   const { combined, verdicts } = la;
   const action = combined.action;
-  const boxClass = action==='BUY' ? 'live-stage-go' : action==='SELL' ? 'live-stage-no' : 'live-stage-warn';
+  const cls = combined.confCls ? ' ' + combined.confCls : '';
+  const vt = combined.verdictText || action;
+  const boxClass = combined.confTier === 'lean' ? 'live-stage-warn'
+    : action==='BUY' ? 'live-stage-go' : action==='SELL' ? 'live-stage-no' : 'live-stage-warn';
   const dirHtml = action==='BUY'
-    ? '<div class="live-verdict-buy">▲ BUY GBP/USD</div>'
+    ? `<div class="live-verdict-buy${cls}">▲ ${vt} — GBP/USD</div>`
     : action==='SELL'
-      ? '<div class="live-verdict-sell">▼ SELL GBP/USD</div>'
+      ? `<div class="live-verdict-sell${cls}">▼ ${vt} — GBP/USD</div>`
       : `<div class="live-verdict-skip">⚠ ${action === 'NO TRADE' ? 'NO TRADE' : 'SKIP'}</div>`;
-  const confLine = combined.combinedConf != null
-    ? `Combined confidence: <span class="mono">${combined.combinedConf}%</span>&nbsp;&nbsp;·&nbsp;&nbsp;` : '';
+  // Confidence floor, tier and sample size are always rendered at full size
+  // next to the direction — never small print, never a tooltip.
+  const chip = combined.dir ? confidenceChip(combined.wlb, combined.combinedConf, combined.dirN) : '';
   const avgPipLine = combined.avgPip
-    ? `Expected move: ~<span class="mono">${(combined.avgPip||0).toFixed(1)}p</span>` : '';
+    ? `<div style="font-size:12px;color:var(--text2);margin-top:10px">Expected move: ~<span class="mono">${(combined.avgPip||0).toFixed(1)}p</span> in the first 5 minutes</div>` : '';
+  const weakBanner = combined.weakNote
+    ? `<div style="background:rgba(239,68,68,0.10);border-left:3px solid #a06767;padding:9px 12px;border-radius:0 6px 6px 0;margin-top:12px;font-size:12px;color:#d98a8a">⚠ ${combined.weakNote}</div>`
+    : '';
   const tagsHtml = combined.tags ? `<div class="live-combined-tags">${combined.tags.join(' · ')}</div>` : '';
   el.innerHTML = `
     <div style="font-size:11px;font-weight:700;letter-spacing:1px;color:${combined.color};margin-bottom:8px">${combined.header}</div>
     <div class="live-combined-verdict ${boxClass}">
       ${dirHtml}
-      <div style="font-size:12px;color:var(--text2);margin-top:8px">${confLine}${avgPipLine}</div>
+      ${chip}
+      ${avgPipLine}
+      ${weakBanner}
       ${tagsHtml}
     </div>
     <div class="live-combined-reasoning">${combined.reasoning}</div>
@@ -1669,10 +2053,41 @@ function renderLiveCombinedStageA() {
 function renderLiveSkipWait() {
   const el = document.getElementById('live-stage-b-container');
   if (!el) return;
+  const reason = liveAssistantState?.rec?.weakReason
+    || 'Actual matched forecast — skip this release per your rules.';
   el.innerHTML = `<div class="live-stage-box live-stage-warn" style="margin-top:16px">
-    <strong>No trade recommended.</strong> Actual matched forecast — skip this release per your rules.
+    <strong>No trade recommended.</strong> ${reason}
     <div style="margin-top:12px"><button class="btn btn-secondary" onclick="cancelLiveMode()">Reset</button></div>
   </div>`;
+}
+
+// Tier 2 (Historical Lean) gate. Not a statistical block — the trader can always
+// proceed — but a weak lean must not flow silently through the identical workflow
+// as a statistically supported direction. Tier 3 skips this entirely.
+function renderLeanGate() {
+  const el = document.getElementById('live-stage-b-container');
+  if (!el) return;
+  el.innerHTML = `<div class="live-stage-box live-stage-warn" style="margin-top:16px">
+    <strong>Weak evidence — discretionary only.</strong>
+    This lean is not statistically supported on its own. The 5-minute assessment will not make it stronger.
+    Proceed only if your own analysis independently supports this direction.
+    <div style="margin-top:14px;display:flex;gap:10px;flex-wrap:wrap">
+      <button class="btn btn-secondary" id="lean-proceed-btn">Proceed to 5-minute assessment anyway</button>
+      <button class="btn btn-danger" onclick="cancelLiveMode()">Don't Trade</button>
+    </div>
+  </div>`;
+  const btn = document.getElementById('lean-proceed-btn');
+  if (btn) btn.onclick = () => {
+    const la = liveAssistantState;
+    logDecision({
+      opportunity_id: la.opportunityId, context_id: la.contextId, stage: 'USER_OVERRIDE',
+      decision: 'PROCEED_ON_WEAK_EVIDENCE', tier: la.rec && la.rec.confTier || null,
+      direction: la.rec && la.rec.dir || null,
+      reason: 'User chose to proceed past the Historical Lean gate',
+      ui_path: 'StageA/leanGate', override_state: { used: true }
+    });
+    startLiveCountdown();
+  };
 }
 
 function startLiveCountdown() {
@@ -1776,6 +2191,32 @@ function renderLiveStageC() {
   const tpPips = sl * rr;
   const entry = la.currentPrice;
   const pipSize = 0.0001;
+  // STAGE_C is a NEW immutable decision row under the same opportunity_id —
+  // "what the app said at +5m" is a different historical fact from Stage A.
+  const _cDecision = la.rec.action === 'SKIP' ? 'SKIP'
+      : absPip < 5 ? 'WEAK_REACTION'
+      : confirmed ? 'READY_TO_ENTER' : 'DIRECTION_CHANGED';
+  logDecision({
+    opportunity_id: la.opportunityId, context_id: la.contextId, stage: 'STAGE_C',
+    decision: _cDecision, tier: la.rec.confTier || null, direction: la.rec.dir || null,
+    reason: _cDecision === 'WEAK_REACTION'
+        ? `Only ${absPip.toFixed(1)}p of movement in 5 minutes`
+        : _cDecision === 'DIRECTION_CHANGED'
+          ? 'Price moved opposite to expectation during the 5-min wait'
+          : (_cDecision === 'READY_TO_ENTER' ? 'Direction confirmed' : 'No clear signal'),
+    client_classification: { pips_moved_5m: pipVal, abs_pips: absPip, confirmed },
+    reference_price: la.currentPrice,
+    proposed_entry: (_cDecision === 'READY_TO_ENTER' || _cDecision === 'WEAK_REACTION') ? entry : null,
+    proposed_sl: _cDecision === 'READY_TO_ENTER'
+        ? (la.rec.action === 'BUY' ? entry - sl * pipSize : entry + sl * pipSize) : null,
+    proposed_tp: _cDecision === 'READY_TO_ENTER'
+        ? (la.rec.action === 'BUY' ? entry + tpPips * pipSize : entry - tpPips * pipSize) : null,
+    warning_state: { weak_reaction: absPip < 5, direction_changed: _cDecision === 'DIRECTION_CHANGED' },
+    override_state: { available: absPip < 5, offered: absPip < 5 ? 'Enter Anyway' : null },
+    ui_path: 'StageC',
+    client_payload: { sl_pips: sl, rr: rr, tp_pips: tpPips, open_price: la.openPrice }
+  });
+
   let html = '';
   if (la.rec.action === 'SKIP') {
     html = `<div class="live-stage-box live-stage-no">
@@ -1831,6 +2272,15 @@ function renderLiveStageC() {
 function confirmLiveEntry() {
   const la = liveAssistantState;
   const errEl = document.getElementById('live-confirm-err');
+  // Separate immutable row: the user's own action, distinct from what the app said.
+  logDecision({
+    opportunity_id: la.opportunityId, context_id: la.contextId, stage: 'USER_OVERRIDE',
+    decision: 'ENTER_ANYWAY', tier: la.rec && la.rec.confTier || null,
+    direction: la.rec && la.rec.dir || null,
+    reason: 'User confirmed entry from Stage C',
+    reference_price: la.currentPrice, ui_path: 'StageC/confirmEntry',
+    override_state: { used: true }
+  });
   // Validate required money fields
   const entryPriceEl = document.getElementById('live-entry-price');
   const lotSizeEl = document.getElementById('live-lot-size');

@@ -83,6 +83,32 @@ NEWS_MAP = [
 # Lookup from event name → value_type (built once at module load)
 _VALUE_TYPE: dict = {row[0]: row[5] for row in NEWS_MAP}
 
+# Minimum Wilson 95% lower bound (percent) on directional consistency before a
+# scenario may be shown as a BUY/SELL rather than "insufficient evidence".
+# 50 is not an arbitrary round number: it is the exact statistical statement
+# "we are 95% confident this direction beats a coin flip". Derived against the
+# full scenario table (see audit) — 5 of 43 group scenarios and 7 of 36
+# single-event scenarios clear it.
+DIRECTION_WLB_MIN = 50.0
+
+
+def wilson_lower_bound(successes: int, n: int, z: float = 1.96) -> float:
+    """Wilson score interval lower bound for a binomial proportion.
+
+    Preferred over a raw proportion because it penalises small samples
+    correctly: 4/5 (80%) returns 0.376, while 40/50 (80%) returns 0.667.
+    Preferred over the normal approximation because it stays well-behaved
+    at proportions near 0 and 1 and at small n, which is exactly the regime
+    most events here sit in.
+    """
+    if n <= 0:
+        return 0.0
+    p = successes / n
+    denom = 1 + z * z / n
+    centre = p + z * z / (2 * n)
+    adj = z * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n))
+    return (centre - adj) / denom
+
 # Per-event absolute threshold cache — populated once at start of run_sync/scrape_upcoming
 _scrape_thresholds: dict = {}
 
@@ -146,6 +172,121 @@ def ensure_tables():
             """)
         except Exception as e:
             print(f"  old constraint drop skipped: {e}")
+
+        # ── SIGNAL / OUTCOME / EXECUTION LOGGING (instrumentation of the frozen
+        # baseline; does not participate in any trading decision) ──────────────
+        logging_ddl = [
+            # Immutable server-side snapshot of the statistical information that
+            # was SERVED to the browser. Never recomputed at post time.
+            """CREATE TABLE IF NOT EXISTS decision_contexts (
+                context_id TEXT PRIMARY KEY,
+                baseline TEXT NOT NULL,
+                kind TEXT NOT NULL,                 -- 'single' | 'group'
+                event_key TEXT NOT NULL,            -- event name or group_key
+                pair TEXT NOT NULL DEFAULT 'GBP_USD',
+                country TEXT,
+                event_date TEXT,
+                event_time TEXT,
+                release_at TIMESTAMPTZ,
+                forecast TEXT,
+                previous TEXT,
+                hist_n INTEGER,
+                up_count INTEGER,
+                down_count INTEGER,
+                raw_consistency REAL,
+                wilson_lower REAL,
+                scenario_stats JSONB,               -- full served payload
+                server_meta JSONB,
+                server_context_created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )""",
+            # One immutable row per MATERIAL DECISION STAGE. Never mutated.
+            """CREATE TABLE IF NOT EXISTS signals (
+                decision_id TEXT PRIMARY KEY,
+                opportunity_id TEXT NOT NULL,
+                context_id TEXT REFERENCES decision_contexts(context_id),
+                baseline TEXT NOT NULL,
+                stage TEXT NOT NULL,                -- STAGE_A | STAGE_C | USER_OVERRIDE | ...
+                decision TEXT NOT NULL,             -- SUPPORTED_DIRECTION_SELL | WEAK_REACTION | ...
+                tier TEXT,
+                direction TEXT,
+                reason TEXT,
+                raw_actual JSONB,
+                normalized_actual JSONB,
+                client_classification JSONB,        -- browser beat/miss/inline (M03 unresolved)
+                scenario_key TEXT,
+                warning_state JSONB,
+                override_state JSONB,
+                reference_price REAL,
+                proposed_entry REAL,
+                proposed_sl REAL,
+                proposed_tp REAL,
+                ui_path TEXT,
+                client_payload JSONB,
+                client_decision_at TIMESTAMPTZ NOT NULL,
+                server_received_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )""",
+            # Append-only. Corrections NEVER rewrite a context or a signal.
+            """CREATE TABLE IF NOT EXISTS signal_corrections (
+                id BIGSERIAL PRIMARY KEY,
+                context_id TEXT,
+                opportunity_id TEXT,
+                field TEXT NOT NULL,
+                old_value TEXT,
+                new_value TEXT,
+                source TEXT,
+                note TEXT,
+                corrected_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )""",
+            # Subsequent market behaviour. Observations, not decision-time info.
+            """CREATE TABLE IF NOT EXISTS signal_outcomes (
+                id BIGSERIAL PRIMARY KEY,
+                opportunity_id TEXT NOT NULL,
+                decision_id TEXT,
+                horizon TEXT NOT NULL,              -- '1m','5m','15m','30m','60m','PATH'
+                price REAL,
+                pips REAL,
+                mfe REAL,
+                mae REAL,
+                hypothetical_result TEXT,           -- TP | SL | OPEN
+                resolved_seconds INTEGER,
+                observed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                UNIQUE(opportunity_id, horizon, decision_id)
+            )""",
+            # What the trader actually did. Separate from what the app said.
+            """CREATE TABLE IF NOT EXISTS executions (
+                id BIGSERIAL PRIMARY KEY,
+                execution_id TEXT UNIQUE NOT NULL,
+                opportunity_id TEXT NOT NULL,
+                decision_id TEXT,
+                status TEXT NOT NULL,               -- TAKEN | SKIPPED | NOT_RECORDED
+                broker TEXT,
+                direction TEXT,
+                actual_fill_price REAL,
+                actual_sl REAL,
+                actual_tp REAL,
+                actual_rr REAL,
+                lot_size REAL,
+                exit_price REAL,
+                realized_pips REAL,
+                realized_r REAL,
+                realized_pnl REAL,
+                notes TEXT,
+                execution_decision_at TIMESTAMPTZ,
+                actual_fill_at TIMESTAMPTZ,
+                actual_exit_at TIMESTAMPTZ,
+                recorded_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )""",
+            "CREATE INDEX IF NOT EXISTS idx_signals_opportunity ON signals (opportunity_id)",
+            "CREATE INDEX IF NOT EXISTS idx_signals_context ON signals (context_id)",
+            "CREATE INDEX IF NOT EXISTS idx_outcomes_opportunity ON signal_outcomes (opportunity_id)",
+            "CREATE INDEX IF NOT EXISTS idx_exec_opportunity ON executions (opportunity_id)",
+        ]
+        for sql in logging_ddl:
+            try:
+                conn.execute(sql)
+            except Exception as e:
+                print(f"  logging schema: {e}")
+
         conn.commit()
         conn.close()
     except Exception as e:
@@ -289,8 +430,19 @@ def get_group_analysis(group_key: str) -> dict:
             ]
             label = " + ".join(label_parts)
             total_dir = d["up"] + d["down"]
-            direction = "up" if d["up"] >= d["down"] else "down"
+            # A tie carries no directional information — do not silently resolve it.
+            # (Previously `up >= down` rendered a 4-4 split as a confident "up".)
+            if total_dir == 0 or d["up"] == d["down"]:
+                direction = None
+            else:
+                direction = "up" if d["up"] > d["down"] else "down"
             consistency = round(max(d["up"], d["down"]) / total_dir * 100) if total_dir > 0 else 0
+            # Wilson 95% lower bound on the modal direction rate. A scenario is only
+            # directionally usable when we can say, at 95% confidence, that the true
+            # rate beats a coin flip (lower bound > 50%). Raw consistency overstates
+            # small samples: 4/5 = 80% but its lower bound is only 37.6%.
+            wlb = round(wilson_lower_bound(max(d["up"], d["down"]), total_dir) * 100, 1)
+            all_inline = all(p == "inline" for p in sc_parts)
             scenarios.append({
                 "scenario":    sc,
                 "label":       label,
@@ -302,6 +454,9 @@ def get_group_analysis(group_key: str) -> dict:
                 "down_count":  d["down"],
                 "direction":   direction,
                 "consistency": consistency,
+                "wilson_lower": wlb,
+                "all_inline":  all_inline,
+                "tradeable":   bool(direction) and wlb > DIRECTION_WLB_MIN and not all_inline,
             })
 
         conn.close()
@@ -1431,17 +1586,36 @@ def _consistency_stats(rows: list) -> dict:
         "miss_count": miss,
         "beat_direction": None,
         "beat_consistency": None,
+        "beat_wilson_lower": None,
+        "beat_tradeable": False,
+        "beat_dir_n": 0,
         "miss_direction": None,
         "miss_consistency": None,
+        "miss_wilson_lower": None,
+        "miss_tradeable": False,
+        "miss_dir_n": 0,
         "max_pip_5m": max(pips_5) if pips_5 else None,
         "min_pip_5m": min(pips_5) if pips_5 else None,
     }
-    if beat > 0:
-        result["beat_direction"] = "up" if beat_up >= beat_down else "down"
+    # Ties carry no directional information and must not resolve to a default.
+    # Wilson lower bound is still computed identically; `tradeable` now drives
+    # only how strongly the call is rendered, not whether it is shown.
+    if beat > 0 and beat_up != beat_down:
+        n_dir = beat_up + beat_down
+        result["beat_direction"] = "up" if beat_up > beat_down else "down"
         result["beat_consistency"] = round(max(beat_up, beat_down) / beat * 100)
-    if miss > 0:
-        result["miss_direction"] = "up" if miss_up >= miss_down else "down"
+        wlb = round(wilson_lower_bound(max(beat_up, beat_down), n_dir) * 100, 1)
+        result["beat_wilson_lower"] = wlb
+        result["beat_tradeable"] = wlb > DIRECTION_WLB_MIN
+        result["beat_dir_n"] = n_dir
+    if miss > 0 and miss_up != miss_down:
+        n_dir = miss_up + miss_down
+        result["miss_direction"] = "up" if miss_up > miss_down else "down"
         result["miss_consistency"] = round(max(miss_up, miss_down) / miss * 100)
+        wlb = round(wilson_lower_bound(max(miss_up, miss_down), n_dir) * 100, 1)
+        result["miss_wilson_lower"] = wlb
+        result["miss_tradeable"] = wlb > DIRECTION_WLB_MIN
+        result["miss_dir_n"] = n_dir
     return result
 
 def format_release_times(event_date: str, event_time: str, country: str) -> dict:
@@ -1608,6 +1782,12 @@ def get_brief(event_name: str) -> dict:
             "miss_direction": stats["miss_direction"],
             "beat_consistency": stats["beat_consistency"],
             "miss_consistency": stats["miss_consistency"],
+            "beat_wilson_lower": stats["beat_wilson_lower"],
+            "miss_wilson_lower": stats["miss_wilson_lower"],
+            "beat_tradeable": stats["beat_tradeable"],
+            "miss_tradeable": stats["miss_tradeable"],
+            "beat_dir_n": stats["beat_dir_n"],
+            "miss_dir_n": stats["miss_dir_n"],
             "beat_count": stats["beat_count"],
             "miss_count": stats["miss_count"],
             "min_pip_5m": stats["min_pip_5m"],
